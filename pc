@@ -1,0 +1,6823 @@
+#!/usr/bin/perl
+
+######
+##
+## Powercut
+## The "swiss army knife" of file management
+## Rsync, cp, bru + time machine with intelligent and persistent file checksumming
+##
+## This version intended mainly for my own use, and grew from 6 years
+## of occasional weekend hacking -- it is a script, not an
+## application. A major re-rewrite and cleanup is needed. Intended to
+## be portable as a single file, so not as tidy as it should be.
+##
+## Run "pc help" for more information
+##
+## Contact Jeremy Gilbert - jgilbert20 at google mail
+######
+ 
+# "stable" version, no exotics
+# this version has been tested to be fully mutli-processor able
+# still funkyiness with multi-threaded internal copy, solution is now to use rsync for heavy file lifting
+#
+# read/write snapshots working
+
+# powercut, version 0.002
+# the swiss army knife of file management tools
+
+# Powercut is now reasonably stable
+
+## WIN32 Notes
+## use ppm for activeperl
+## ppm install MLDBM
+
+# export PERL_SIGNALS=unsafe
+
+my $MAINREPORTNAME = "zz__PC-main-report-$$.txt";
+
+local $main::GUARD_SIZE = 200_000;
+my $TOTAL_FILES_EXPECTED = 4_000_000;
+# for reference, my main drobo system has 1.5M files. 
+
+use Time::HiRes qw( CLOCK_REALTIME gettimeofday tv_interval);
+
+## A quick helper function intended to help setting up databases
+
+sub ckstatus
+{
+    my $status = shift;
+
+    if( $status )
+    {
+	die "Status $status on database! Bombing out: $BerkeleyDB::Error\n";
+    }
+}
+
+my $NOW = time();
+
+my $FILESEP = "/";
+
+## Trap control-c and trigger a graceful shutdown that closes
+## filehandles, etc.
+
+$SIG{INT} = sub { doshutdown(1); };
+
+## Pull in our database modules
+
+use BerkeleyDB;
+use BerkeleyDB::Hash;
+use BerkeleyDB::Btree;
+
+use File::Basename;
+use DB_File;
+use File::Spec;
+use Digest::MD5;
+use Getopt::Long;
+use FileHandle; 
+use POSIX;
+use File::Find; 
+
+###
+### Debugging Constants
+###
+
+my $GENERAL_DEBUG = 1;# Should general "debug" statments print anything out?
+my $MDB_DEBUG = 0;    # instrumentation for the master db: refreshAfn and discover
+my $FCA_DEBUG = 0;    # instrumentation for the file copy agent and fiends
+my $IO_DEBUG = 1;     # notify when full, partial or stats occur
+my $RH_DEBUG = 0;     # debug all reverse hash operations
+
+my $EXPRESSTEST = 0;  # cheat on all reads to make faster 
+
+
+# Depricated
+my $bytesInQueue = 0;
+my $bytesTotal =  0;
+
+use strict;
+#no strict 'refs';
+
+#use MLDBM;
+#use MLDBM qw( DB_File Storable );
+use MLDBM qw( BerkeleyDB::Hash Storable );
+# MLDBM handles serialization.. ok to use it without Storeable, but it makes the whole program much slower
+
+my $assurePREFIX = "zz__" . POSIX::strftime( "%Y%m%d", gmtime($NOW) ) . "-$$";
+
+
+###
+### Global vars for command line
+###
+
+my $execute = 0;
+my $fakeMode= 0;
+my $FASTMODE = 0;
+my $clearLock= 0;
+my $recurse = 0;
+my $includezerolen = 0;
+my $fuzzyMode = 0;
+my $noDB = 0;
+my $nocopy_mode = 0;
+my $PHOTO_MODE = 0;
+my $VAULT_NAME = '';
+
+###
+### Global stats variables
+###
+
+my $count_fullreads = 0;
+my $count_stat = 0;
+my $count_fullreads = 0;
+my $count_fastreads = 0;
+my $byte_fullreads = 0;
+my $byte_fastreads = 0;
+my $count_dupfiles = 0;
+my $count_dupbytes = 0;
+my $count_targetFilesProcessed = 0;
+
+local $main::count_dbread = 0;
+local $main::count_dbwrite = 0;
+
+my $FILEVERSEQ = 0;
+
+###
+### Define the "guard times", in seconds, for if we trust the file
+### database -- the shorter this is, the more often powercut will hit
+### the disk.
+### 
+
+my $statWindow = (60*60*24)*     5;
+my $fasthashWindow = (60*60*24)* 30 * 18;
+my $fullhashWindow = (60*60*24)* 30 * 18;
+
+my $hitdisk = 0;
+
+my @AUXPATH;
+my @SNAPSHOTS;
+my @SPARES;
+my @ORPHANPATH;
+
+my $DOMAIN_NAME;
+my $RELPATHMODE;
+my $FILLMODE;
+my $PRIORITY_SETTING;
+my $maxSize;
+
+&GetOptions( 'fake|F' => \$fakeMode,
+	     'fuzzy' => \$fuzzyMode,
+	     'priority=s' => \$PRIORITY_SETTING,
+	     'fill' => \$FILLMODE,
+	     'hitdisk|X+' => \$hitdisk,
+	     'fast|f' => \$FASTMODE,
+	     'fullpaths' => \$RELPATHMODE,
+	     'photo|P' => \$PHOTO_MODE,
+	     'vaultName|N=s' => \$VAULT_NAME,
+	     'nodb' => \$noDB,
+  	     'nocopy' => \$nocopy_mode,
+             'spare|S=s' => \@SPARES,  # look in this directory first for winkins
+	     'recurse|R' => \$recurse,
+	     'maxsize|s=s' => \$maxSize,
+	     'auxilliarypath|A=s' => \@AUXPATH,
+	     'include-snapshot|I=s' => \@SNAPSHOTS,
+	     'orphanpath|O=s' => \@ORPHANPATH,
+	     'database|D=s' => \$DOMAIN_NAME,
+	     'execute|E' => \$execute,
+	     'clearlock|C' => \$clearLock ) or die;
+
+my $fastDriveAlt;
+$fastDriveAlt = "/Volumes/140Data";
+$fastDriveAlt = "/Volumes/TaliaRAID";
+
+my $HOME = $ENV{HOME};
+$HOME = $fastDriveAlt if -e $fastDriveAlt;
+
+
+$DOMAIN_NAME = "default" if not defined $DOMAIN_NAME;
+
+my $WDIR = "$HOME/.powercut";
+$WDIR .= "-$DOMAIN_NAME" if defined $DOMAIN_NAME;
+
+my $DBDIR = "$WDIR/db";
+my $EDIR = "$ENV{HOME}/.pcrun/EXEC-$$";
+
+my %numReports;
+my %fnTofh;
+
+#########################################################
+#
+# Start of the main function
+
+sub debug($);
+
+my $op = shift @ARGV;
+debug "Operation = [$op]";
+debug "Working directory = [$WDIR]";
+
+##
+## Reset - Clear out the database entirely, used for testing
+##
+
+if( $op eq "reset" )
+{
+    my $NEW = "$WDIR-$$";
+
+    print "Renamed [$WDIR] to [$NEW]\n";
+    rename $WDIR, $NEW or die "Cannot rename\n";
+    
+    exit(0);
+}
+
+# print "hitdisk=$hitdisk\n";
+
+$statWindow = 0 if( $hitdisk > 0 );
+$fasthashWindow = 0 if( $hitdisk > 1 );
+$fullhashWindow = 0 if( $hitdisk > 2 );
+
+sub debug ($)
+{
+	return if not $GENERAL_DEBUG;
+	my $a = shift @_;
+	
+	
+	chomp $a;
+	print "DEBUG_LINE: " . $a . "\n";
+}
+
+use File::Path;
+use File::Basename;
+use File::Copy; 
+
+sub mkdirs
+{
+    my $dir = shift;
+    my $dirx = dirname $dir;
+
+    print "MKDIRS: $dirx\n";
+
+    eval{ mkpath($dirx,1) };
+    $@ and die "Couldn't create dir path: $@";
+    die "Did not find new path" if not -d $dirx;
+}
+
+################
+# Check working directories
+
+if( not -e $WDIR )
+{
+    mkdir $WDIR or die "Error creating [$WDIR]: $!";
+}
+
+if( not -e $DBDIR )
+{
+    mkdir $DBDIR or die "Error creating [$DBDIR]: $!";
+}
+
+if( not -e $EDIR )
+{
+    mkdir $EDIR or die "Error creating [$EDIR]: $!";
+}
+
+die "Cannot create $WDIR" unless -w $WDIR;
+die "Cannot create $DBDIR" unless -w $DBDIR;
+
+########################
+# Primitive lock detections
+
+# As of 12/24/2009, pc is ok for concurrent access, so this is disabled
+# 12/26/2009 - tested quite a bit, looks stable. Flag for removal in future
+# versions
+
+if( 0 )
+{
+
+    unlink "$WDIR/lockfile" if $clearLock;
+    
+    # A hack to prevent multiple instances
+    if( not $clearLock )
+    {
+	die "Lockfile exists" if -e "$WDIR/lockfile";
+	system( 'touch', "$WDIR/lockfile");
+	die "Can't write lockfile" unless -e "$WDIR/lockfile";
+	## fixthis use of touch - be more robust about getting an exclusive lock
+    }
+
+}
+
+################
+### Tie in Databases. MLDBM handles serialization automatically.
+
+use BerkeleyDB;
+
+debug "Starting db...\n";
+
+my $bdb_env = new BerkeleyDB::Env 
+    -Verbose => 1,
+    -Home => $DBDIR,
+    -Flags => DB_CREATE|DB_INIT_MPOOL|DB_INIT_CDB,
+    -ErrFile => "$DBDIR/Errors-$$",
+    -ErrPrefix => "PCJAG";
+
+# my $s = $bdb_env->open();
+# print "Opening $s\n";
+
+##################
+# This database maps absolute filenames to an Asset Record Struct (hashs, sizes and dates last chcked, etc)
+
+my %afnToAssetRecord;
+
+if( 0 )
+{
+my $status = BerkeleyDB::db_verify
+    -Filename => "$DBDIR/afn-to-hash.db",
+    -Env => $bdb_env;
+}
+
+debug "Maping DB db...\n";
+
+my $afnToAssetRecordBDB = new BerkeleyDB::Btree
+    -Flags    => DB_CREATE,
+    -Filename => "$DBDIR/afn-to-hash.db",
+#    -Nelem         => $TOTAL_FILES_EXPECTED,
+    -Env => $bdb_env;
+
+debug "DB mapped ...\n";
+
+die "$! $BerkeleyDB::Error " unless $afnToAssetRecordBDB;
+
+my $afnToAssetRecordDB = tie %afnToAssetRecord, "MLDBM";
+$afnToAssetRecordDB->UseDB( $afnToAssetRecordBDB );
+die unless defined $afnToAssetRecordDB;
+
+
+##################
+# A cache, not fully implemented, of hashes to a list of Afns
+
+my %hashToAfn;
+
+my $hashToAfnBDB = new BerkeleyDB::Hash
+    -Flags    => DB_CREATE,
+    -Property => DB_DUP,
+    -Nelem         => $TOTAL_FILES_EXPECTED,
+    -Filename => "$DBDIR/hash-to-afn.db",
+    -Env => $bdb_env;
+
+debug "Hash DB mapped ...\n";
+
+die "$! $BerkeleyDB::Error " unless $hashToAfnBDB;
+
+my $hashToAfnDB = tie %hashToAfn, "MLDBM";
+$hashToAfnDB->UseDB( $hashToAfnBDB );
+die unless defined $hashToAfnDB;
+
+
+##################
+# A cache, not fully implemented, of sizes to a list of Afns
+
+my %sizeToAfn;
+
+my $sizeToAfnBDB = new BerkeleyDB::Hash
+    -Flags    => DB_CREATE,
+    -Property => DB_DUP,
+    -Nelem         => $TOTAL_FILES_EXPECTED,
+    -Filename => "$DBDIR/size-to-afn.db",
+    -Env => $bdb_env;
+
+debug "Size DB mapped ...\n";
+
+die "$! $BerkeleyDB::Error " unless $sizeToAfnBDB;
+
+my $sizeToAfnDB = tie %sizeToAfn, "MLDBM";
+$sizeToAfnDB->UseDB( $sizeToAfnBDB );
+die unless defined $sizeToAfnDB;
+
+##################
+# A cache, not fully implemented, of fasthash to a list of Afns
+
+my %fasthashToAfn;
+
+my $fasthashToAfnBDB = new BerkeleyDB::Hash
+    -Flags    => DB_CREATE,
+    -Property => DB_DUP,
+    -Filename => "$DBDIR/fasthash-to-afn.db",
+    -Env => $bdb_env;
+
+debug "Fasthash DB mapped ...\n";
+
+die "$! $BerkeleyDB::Error " unless $fasthashToAfnBDB;
+
+my $fasthashToAfnDB = tie %fasthashToAfn, "MLDBM";
+$fasthashToAfnDB->UseDB( $fasthashToAfnBDB );
+die unless defined $fasthashToAfnDB;
+
+###############
+# Create the reverse hash management objects
+
+my $hashDB = ReverseHash->create( $hashToAfnBDB, $RH_DEBUG, "hash" );
+my $fastDB = ReverseHash->create( $fasthashToAfnBDB, $RH_DEBUG, "fast" );
+my $sizeDB = ReverseHash->create( $sizeToAfnBDB, $RH_DEBUG, "size" );
+
+
+##################
+# Our directory management database
+
+local %main::afnToDirent;
+
+my $afnToDirentBDB = new BerkeleyDB::Btree
+    -Flags    => DB_CREATE,
+    -Filename => "$DBDIR/afn-to-dirent.db",
+#    -Nelem         => $TOTAL_FILES_EXPECTED,
+#    -Ffactor       => ((4096-32)/(200 + 400 + 8)),
+    -Env => $bdb_env;
+
+debug "Directory DB mapped ...\n";
+
+die "$! $BerkeleyDB::Error " unless $afnToDirentBDB;
+
+my $afnToDirentDB = tie %main::afnToDirent, "MLDBM";
+$afnToDirentDB->UseDB( $afnToDirentBDB );
+die unless defined $afnToDirentDB;
+
+
+
+##################
+#
+# Our file version database
+#
+# A fileversion is a directory of known versions of files that is used
+# for computing work to be done note that it is NOT used for caching
+# hashes. Its designed to hold contents of vaults or other files that
+# are backed up in other locations
+
+local %main::fileversion;
+
+my $fileversionBDB = new BerkeleyDB::Hash
+    -Flags    => DB_CREATE,
+    -Filename => "$DBDIR/fileversion.db",
+#    -Ffactor       => (4096-32)/(200 + 1000 + 8),
+    -Nelem         => $TOTAL_FILES_EXPECTED,
+    -Env => $bdb_env;
+
+# hhfactor: (pagesize - 32) / (average_key_size + average_data_size + 8)
+# nelham - final size of hash
+
+debug "Fileversion DB mapped ...\n";
+
+die "$! $BerkeleyDB::Error " unless $fileversionBDB;
+
+my $fileversionDB = tie %main::fileversion, "MLDBM";
+$fileversionDB->UseDB( $fileversionBDB );
+die unless defined $fileversionDB;
+
+##################
+# Directory  of hashes to a list of FVs
+
+my %hashToFV;
+
+my $hashToFVBDB = new BerkeleyDB::Hash
+    -Flags    => DB_CREATE,
+    -Property => DB_DUP,
+    -Filename => "$DBDIR/hash-to-FV.db",
+    -Nelem         => $TOTAL_FILES_EXPECTED,
+    -Env => $bdb_env;
+
+debug "Hash DB mapped ...\n";
+
+die "$! $BerkeleyDB::Error " unless $hashToFVBDB;
+
+my $hashToFVDB = tie %hashToFV, "MLDBM";
+$hashToFVDB->UseDB( $hashToFVBDB );
+die unless defined $hashToFVDB;
+
+
+##################
+# A cache, not fully implemented, of sizes to a list of FVs
+
+my %sizeToFV;
+
+my $sizeToFVBDB = new BerkeleyDB::Hash
+    -Flags    => DB_CREATE,
+    -Property => DB_DUP,
+    -Filename => "$DBDIR/size-to-FV.db",
+    -Nelem         => $TOTAL_FILES_EXPECTED,
+    -Env => $bdb_env;
+
+debug "Size DB FV mapped ...\n";
+
+die "$! $BerkeleyDB::Error " unless $sizeToFVBDB;
+
+my $sizeToFVDB = tie %sizeToFV, "MLDBM";
+$sizeToFVDB->UseDB( $sizeToFVBDB );
+die unless defined $sizeToFVDB;
+
+##################
+# A cache, not fully implemented, of fasthash to a list of FVs
+
+my %fasthashToFV;
+
+my $fasthashToFVBDB = new BerkeleyDB::Hash
+    -Flags    => DB_CREATE,
+    -Property => DB_DUP,
+    -Filename => "$DBDIR/fasthash-to-FV.db",
+    -Nelem         => $TOTAL_FILES_EXPECTED,
+    -Env => $bdb_env;
+
+debug "Fasthash DB FV mapped ...\n";
+
+die "$! $BerkeleyDB::Error " unless $fasthashToFVBDB;
+
+my $fasthashToFVDB = tie %fasthashToFV, "MLDBM";
+$fasthashToFVDB->UseDB( $fasthashToFVBDB );
+die unless defined $fasthashToFVDB;
+
+###############
+# Create the reverse hash management objects for fileversions
+
+my $FV_DEBUG = 0;
+
+my $hashFVDB = ReverseHash->create( $hashToFVBDB, $FV_DEBUG, "hash-FV" );
+my $fastFVDB = ReverseHash->create( $fasthashToFVBDB, $FV_DEBUG, "fast-FV" );
+my $sizeFVDB = ReverseHash->create( $sizeToFVBDB, $FV_DEBUG, "size-FV" );
+
+
+my $fvDB = FileVersionDB->create();
+$fvDB->debugmode(1);
+$fvDB->debugname("main");
+
+sub dbcheck
+{
+    debug "-------------------";   
+
+    my $db = $afnToAssetRecordBDB;
+    my $key = "SIZE-$$";
+    $key = undef;
+    my $status;
+    my $size = "TEST";
+    
+    $main::count_dbwrite++;
+
+    $status = $db->db_put($key,$size);
+    debug "Status = $status, Error: $BerkeleyDB::ERROR";
+
+    my $s;
+
+
+    $main::count_dbread++;
+    $status = $db->db_get( $key, $s );
+    debug "Status = $status, Error: $BerkeleyDB::ERROR";
+    debug "Straight check: $s vs $size";
+
+    debug "-------------------";
+
+    die if $s ne $size;
+}
+
+sub getSizeHitDisk
+{
+    my $fn = shift;
+    $count_stat++;
+    print "STAT: $fn\n"  if $IO_DEBUG;
+    return -s $fn;
+}
+    
+sub getHashHitDisk
+{
+    my $fn = shift;
+
+    $count_fullreads++;
+    $byte_fullreads = -s $fn;
+    print "FULLREAD: $fn\n"  if $IO_DEBUG;      
+    return getHashFNReg( $fn );
+}
+
+sub getFastHashHitDisk
+{
+    my $fn = shift;
+    my $depth = shift;
+
+    $count_fastreads++;
+    print "FASTREAD: $fn\n" if $IO_DEBUG;    
+    return getFastHashFNReg( $fn, $depth );
+}
+
+sub reportmain;
+
+sub report;
+
+sub reportIOError ($)
+{
+    my $msg = shift;
+
+    reportmain $msg;
+
+    return undef;
+}
+
+sub getHashFNReg($)
+{
+    my $fn = shift;
+    
+    if( $EXPRESSTEST )
+    {
+	return getFastHashFNReg( $fn, 1 );
+    }
+
+    my $fh = new FileHandle();
+
+    open $fh, "<", $fn or return reportIOError "Cannot open [$fn] for hash: $!";
+    my $ctx = Digest::MD5->new();
+    $ctx->addfile( *$fh );
+    my $digest = $ctx->hexdigest();
+    close $fh or return reportIOError "Cannot close [$fn] for hash: $!";
+
+    print "FULLHASH $digest FOR $fn\n";
+
+    return $digest;
+}
+
+sub getFastHashFNReg($$)
+{
+    my $fn = shift;
+    my $depth = shift;
+
+    my $r = undef;
+    
+    my $fh = new FileHandle();
+
+    open $fh, "<", $fn or return reportIOError "Cannot open [$fn] for fast hash: $!";
+    my $ctx = Digest::MD5->new();
+
+    my $data;
+
+    # Read the first X bit of the file from start
+
+    $r = sysread $fh, $data, 16000;
+    return reportIOError "Cannot read [$fn] for hash: $!" if not defined $r;
+    $ctx->add($data);
+	$main::byte_fastread += length $data;
+
+    # Jumpi in to 100K inside the file  X from cur poisition;
+
+    $r = $fh->sysseek( 100000, 1);
+    return reportIOError "Cannot seek [$fn] for hash: $!" if not defined $r;
+    $r = sysread $fh, $data, 16000;
+    return reportIOError "Cannot sysread [$fn] for hash: $!" if not defined $r;
+	$main::byte_fastread += length $data;
+
+    # Jump to X before the end of the file, read more
+
+    $r = $fh->sysseek( 16000, 2);
+    return reportIOError "Cannot seek (2) [$fn] for hash: $!" if not defined $r;
+    $r = sysread $fh, $data, 16000;
+    return reportIOError "Cannot sysread (2) [$fn] for hash: $!" if not defined $r;
+	$main::byte_fastread += length $data;
+	
+    $ctx->add($data);
+
+    my $digest = $ctx->hexdigest();
+
+    print "FASTHASH $digest FOR $fn\n";
+
+    close $fh or return reportIOError "Cannot close [$fn] for fasthash: $!";
+    return $digest;
+}
+
+sub isAFNinMasterDatabase
+{
+    my $afn = shift;
+
+    my $r = $afnToAssetRecord{$afn};
+
+    return defined $r;
+}
+
+sub reportmain
+{
+    my @a = @_;
+
+    report( "$WDIR/pcout-$$.txt", @a );
+    # report( $MAINREPORTNAME, @a );
+    print @a;
+
+}
+
+my @filearg = @ARGV;
+
+my @fileargABS = map 
+{ 
+#print $_;
+    "" . File::Spec->rel2abs( $_ );  
+}  @filearg;
+
+##
+## Print Help Information
+##
+
+if( $op eq "help" )
+{
+    print <<__HELP;
+
+Welcome to Powercut, the swiss-army knife of file tools This tool
+maintains a master database of checksums and locations for any file on
+your computer.  Powercut uses its master database as a caching
+database -- nearly any operation can potentially update the master
+database based on new discoveries. The database is trusted to be
+accurate if its record timestamps fall within certain limits. Powercut
+learns where files are stored on your drive over time and their
+checksums, so that it can quickly resolve if a file has been
+previously backed up or copied.
+
+  Syntax: pc [flags OPERATION [direct object(s)]
+
+FLAGS
+
+  -R  - Recurse
+  -N  - Sets the name of a snapshot or a vault
+  -D  - Alternative database name to use 
+  -f  - "Fast mode", will try to use fast-hashes instead of full hashes for comparisons. 
+           only applies to certain modes
+  -A  - Auxiliary paths to check for duplicates
+  -I  - Auxiliary snapshots to check for duplicates
+
+  -X, --hitdisk = put in more of these to disable stat, fast and full caches
+                 -X - disable stat
+                 -X -X - disable stat and fasthash, etc
+
+  -s, --maxsize [bytes] -- for the fastbackup tool, sets the total number of bytes to fill on the destination drive 
+
+  --priority=23 -- sets the priory threshold. files not meeting the
+    priorty set will be disregarded by certain tools (not universally
+    implemented) Note that anything about 50 is general purpose, and
+    anything 60 or above is a good candidate for multiple backups
+
+    50 - back up everything that is general purpose
+    40 - back up photos and other things not clearly rejects or deletes
+    30 - back up 
+
+OPERATIONS
+
+  scan <files>   - Updates the master database with the files listed
+  ls <paths>     - Prints out information known about the listed files from the "assure" database
+  lsdup <paths>  - Prints out all duplicates WITHIN a given path
+  lsdup-across   - Looks for files in the named directory that are duplicated in the -A and -I areas
+  help           - Print a useful help message
+  reset          - Wipes the current database (moved, not deleted.)
+  snapshot <files>   - Creates a new snapshot file, with the listed files
+  read <snapshots>  - Loads the snapshots, freshening the master DB with newer or more complete data
+  register <snapshot>   - Registers the snapshot as a vault in the file version database
+                          (does not touch the db)
+  compare <snapshots> - lists files that currently differ from those in the snapshot
+	    note: the snapshot stores absolute paths, so this only works if nothings been moved
+
+  assure         - updates the backup status of the listed files 
+  print          - translate a snapshot to a human readable files
+  clearpcip      - remove .pcip_info files
+  
+  fastbackup source1 [source2] destination [-s 10002] [-E] [-R] --priority=23 --fill
+
+              This is an expresslane backup tool that integrates with the file database.  The tool
+              scans the source, looking for files that are not already registered file versions,
+              then performs an rsync to copy them over to the destination.  Files are dropped into a
+              backup-200120312 style directory.  The tool then performs a FULL scan of the
+              destination to create a snapshot file and simultaneously registers them into the
+              database, all in one go. --fill fills 98% of the destination drive; 
+
+  backup target source1 [source2] [-A auxcopylocation] [-I snapshot1 [-I snapshot2..]]
+
+	      Looks for files in in the source directories that are not already in the named
+	      snapshots or auxiliary locations, and copies them over. Does not update assure
+	      database. A great tool for making progressive, but lean backups
+
+  rsync [-R] source1 [source2] target [--fast] [--nocopy] [--spares=sparedir] [-E / --execute] [--fullpaths]
+
+	      Rsync replacement that handles folder renames. Fairly
+	      robust.  -E is needed to execute --fast is highly
+	      recommended and matches rsync(1)s exact level of
+	      suspicon -- e.g. it does not rechecksum files if the
+	      size and moddate are equivilent.  This implementation
+	      can deal with spare directories that overlap the
+	      desintation.  --spares provides one or more directories
+	      that can be used for "wink in", e.g.  if the file is
+	      present in a spare, it will be moved rather than copied.
+	      --nocopy only performes wink ins, and avoids copying
+	      files, which is useful as a pre-processor to the real
+	      rsync(1) command. All copies are performed using cp -av.
+	      --fullpaths concats the full paths to the target,
+	      somewhat like -R in the traditional rsync(1).
+
+Example:
+
+    pc snapshot -R . -N name 
+    Make a checksum of an entire directory starting here
+
+    pc compare snapshot-20080302333.pc
+    List all changes occured since the snapshot was taken. (DB is reconstructed automatically)
+
+
+Multiple invocations
+
+Perfectly ok for multiple powercut instances to be active at the same time. BerkeleyDB concurrent
+data store is used so this is efficient and deadlock free.
+
+Backup:
+
+The backup operation checks over the sources listed and marks any file not found in the target to
+the target. Files are written into a special "backup-" directory at the root of the target, and the
+name also contains the date/time. A copy is made based entirely on checksums -- if the file in
+question happens to exist somewhere else under the target pathname, even if it has a different name,
+etc, no copy will be made.
+
+The script does not currently copy anything, it just creates a file with zero-delimited filenames
+that need to be copied.
+
+The backup operation can take listed snapshots and pathnames of existing backups and use those to
+prune down the list further. Therefore, a file is only backed up if 1) it does not exist under the
+target tree 2) it does not exist under the listed "auxiliary" paths 3) it does not exist under the
+listed snapshots.
+
+This code is working, but slow, as of 12/29. Its slow because a full decent to enumerate sizes is
+needed for each listed path before the script can start generating output.
+
+
+Assure:
+
+Assure is a new metaphor providing a faster way to mark files for
+backup. In the assure operation does a recursive check of the
+directory names and marks for backup any files not already marked as a
+vault in the file version database. Example:
+
+  pc load -N vault01 snapshot-400234.pc
+  pc load -N vault02 snapshot-3242333.pc
+
+  pc assure
+    # writes to a file the paths needing backup.
+
+The marked database of files to back up is also viewable using the "ls"
+commend which also marks the percentage of each directory that is backed up.
+
+Known Issues:
+
+- no backups are done, only marked
+- the "size" reverse hash slows down snapshoting considerably, so is disabled
+- zero length files are always marked for backup
+ 
+
+
+__HELP
+
+    
+    exit(0);
+}
+
+##
+## Adds or refreshes the set of files in the master checksum database.
+## Any file not inside the "tolerable" window of delay (or a new file)
+## gets a refresh.  
+##
+
+elsif( $op eq "scan" )
+{
+    my $fi = new FileIterator( @filearg );
+    while( my $fn = $fi->getNext() )
+    {
+	my $afn = File::Spec->rel2abs( $fn ) ;
+	next unless -f $afn;
+	
+	## For each file, we have to decide if the file is new, or old
+	## if old, check our rules for refreshing data in the cache
+
+	reportmain( "Checking [$afn]\n" );
+	my $r = refreshAFN( $afn, $statWindow, $fasthashWindow, $fullhashWindow );
+    }
+}
+
+elsif( $op eq "symcache" )
+{
+    my $fi = new FileIterator( @filearg );
+    while( my $fn = $fi->getNext() )
+    {
+	my $afn = File::Spec->rel2abs( $fn ) ;
+	next unless -f $afn;
+	
+	## For each file, we have to decide if the file is new, or old
+	## if old, check our rules for refreshing data in the cache
+
+	reportmain( "Checking [$afn]\n" );
+	my $r = refreshAFN( $afn, $statWindow, $fasthashWindow, $fullhashWindow );
+	print "$afn -> $r->{'HASH'}\n";
+
+	my $hash = $r->{'HASH'};
+
+	my $newPath = "./symcache/";
+
+	$newPath .= substr $hash, 0, 3;
+	$newPath .= "/";
+	$newPath .= substr $hash, 3, 3;
+	$newPath .= "/";
+	$newPath .= "$hash";
+
+	my $dirx = $newPath;
+
+    eval{ mkpath($dirx,1) };
+    $@ and die "Couldn't create dir path: $@";
+    die "Did not find new path" if not -d $dirx;
+
+	$newPath .= "/" .  basename $afn;
+
+	print "SYMCACHE: $afn -> $newPath\n";
+
+
+	symlink( $afn, $newPath );
+    }
+}
+
+elsif( $op eq "clearpcip" )
+{
+    my    $cmd = "find . -name '.pcip_info' -print0 | xargs -0 -n 100 rm -v";
+
+    print "USE THIS COMMAND TO CLEAN HINGS UP: [$cmd]\n";
+
+
+}
+
+
+##
+## Creates a permanent record of the listed files, their sizes and checksum
+## for later comparison
+##
+
+
+
+elsif( $op eq "snapshot" )
+{
+    handleMakeSnapshot( @filearg );
+}
+
+
+
+
+##
+## Read -- slurps in a snapshot into the master database. This will freshen
+## any data in the master DB more recent than what is already there
+##
+
+elsif( $op eq "read" )
+{
+    my $fi = new FileIterator( @filearg );
+
+    my $START_GTOD_MAIN = [gettimeofday];
+    my $i;
+
+    while( my $fn = $fi->getNext() )
+    {
+	my $afn = File::Spec->rel2abs( $fn ) ;
+	next unless -f $afn;
+
+	my $ssr = new SnapshotReader( $afn ); 
+	while( $ssr->hasNext() )
+	{
+	    my $START_GTOD = [gettimeofday];
+	    $i++;
+
+	    my $ar = $ssr->getNext();
+	    my $afn = $ar->[0];
+	    discover_file( @$ar );
+
+
+	    my $tpi = tv_interval( $START_GTOD ) * 1000000;
+	    my $tps = 1/(tv_interval( $START_GTOD_MAIN ) / $i);
+	    debug sprintf "READ: $afn (%.0f usec) (%1.3f per second est)", $tpi, $tps;
+
+	}
+	
+	$ssr->close();
+    }
+}
+
+elsif( $op eq "register" )
+{
+    die "Must specify a vault name" unless $VAULT_NAME;
+
+    my $vaultName = $VAULT_NAME;
+
+    my $START_GTOD = [gettimeofday];
+    my $i;
+
+    my $tpi;
+    my $tps;
+
+    my $axe =1000;
+
+    my $fi = new FileIterator( @filearg );
+    while( my $fn = $fi->getNext() )
+    {
+	my $afn = File::Spec->rel2abs( $fn ) ;
+	next unless -f $afn;
+
+	my $ssr = new SnapshotReader( $afn ); 
+	while( $ssr->hasNext() )
+	{
+	    my $ar = $ssr->getNext();
+	    
+	    my $hash = $ar->hash();
+	    my $size = $ar->size();
+
+	    my $fn = $ar->fn();
+
+
+	    debug sprintf "REGISTER: $fn $hash $size (%.0f usec) (%1.3f per second est) (c=$i)", $tpi, $tps;
+
+#	    print "Registration: $fn $hash $size ($tpi usec/entry) ($tps per sec) - $i total\n";
+	    
+	    $i++;
+
+	    $fvDB->registerFileVersion( -Type          => 'Vault',
+					-Afn           => $ar->fn(),
+					-Size          => $ar->size(),
+					-SizeDate      => $ar->sizedate(),
+					-FastHash      => $ar->fasthash(),
+					-FastHashDate  => $ar->fasthashdate(),
+					-FastHashDepth => $ar->fasthashdepth(),
+					-Hash          => $ar->hash(),
+					-HashDate      => $ar->hashdate(),
+					-RegistrationDate    => $NOW,
+					-VaultName     => $vaultName,
+					-Source        => $afn );
+
+
+	if( $i % $axe == 0)
+	{
+	    $tpi = tv_interval( $START_GTOD )*1_000_000 / $axe;
+	    $tps = 1/(tv_interval( $START_GTOD ) / $axe);
+
+	    $START_GTOD = [gettimeofday];
+	}
+
+
+	}
+	
+	$ssr->close();
+    }
+}
+
+
+
+elsif( $op eq "register-test" )
+{
+    die "Must specify a vault name" unless $VAULT_NAME;
+
+    my $vaultName = $VAULT_NAME;
+
+    my $START_GTOD = [gettimeofday];
+    my $i;
+
+    my $tpi;
+    my $tps;
+
+    my $axe =1000;
+
+    my %tmp;
+
+    my $fi = new FileIterator( @filearg );
+    while( my $fn = $fi->getNext() )
+    {
+	my $afn = File::Spec->rel2abs( $fn ) ;
+	next unless -f $afn;
+
+	my $ssr = new SnapshotReader( $afn ); 
+	while( $ssr->hasNext() )
+	{
+	    my $ar = $ssr->getNext();
+	    
+	    my $hash = $ar->hash();
+	    my $size = $ar->size();
+
+	    my $fn = $ar->fn();
+
+	    $tmp{$hash} = $size;
+	    
+
+#	    debug sprintf "REGISTER: $fn $hash $size (%.0f usec) (%1.3f per second est) (c=$i)", $tpi, $tps;
+	}
+	
+	$ssr->close();
+    }
+}
+
+
+
+
+elsif( $op eq "print" )
+{
+    my $vaultName = $VAULT_NAME;
+
+    my $fi = new FileIterator( @filearg );
+    while( my $fn = $fi->getNext() )
+    {
+	my $afn = File::Spec->rel2abs( $fn ) ;
+	next unless -f $afn;
+
+	my $ssr = new SnapshotReader( $afn ); 
+	while( $ssr->hasNext() )
+	{
+	    my $ar = $ssr->getNext();
+
+	    my $afn = $ar->fn();
+
+	    report( "$fn.txt", "$afn\n" );
+
+	}
+	
+	$ssr->close();
+    }
+}
+
+
+
+##
+## Compare - lists files that currently differ from those found in the snapshot
+##
+
+elsif( $op eq "compare" )
+{
+    my $count = 0;
+
+    my $fi = new FileIterator( @filearg );
+    while( my $fn = $fi->getNext() )
+    {
+	my $afn = File::Spec->rel2abs( $fn ) ;
+	next unless -f $afn;
+
+	my $ssr = new SnapshotReader( $afn ); 
+	while( $ssr->hasNext() )
+	{
+	    my $ar = $ssr->getNext();
+
+	    my $hash = $ar->hash();
+	    my $afn = $ar->fn();
+
+	    my $actualHash = getChecksum( $afn );
+
+	    my $status;
+
+	    if( $actualHash eq $hash )
+	    {
+		$status = "OK   ";
+	    }
+	    else
+	    {
+		$status = "DIFF ";
+	    }
+
+	    print "$status$afn\n";
+
+	    $count ++;
+	}
+	
+	$ssr->close();	
+
+	print "Read $count records from [$fn]\n";
+    }
+}
+
+## Test if the snapshot could be reconstructed by the listed files -- what would be missing?
+
+elsif( $op eq "recon" )
+{
+
+    my %seenHashes;
+    my %hashToAfn;
+
+    # First, scan over the entire snapshot
+
+    my $fn = shift @filearg;
+    die "Can't read file $fn: $!" unless -r $fn;
+    
+    open FILE, "<$fn" or die "Cannot open [$fn]: $!";
+    
+    my $count = 0;
+
+    while( not eof FILE )
+    {
+	my ($afn, $vec);
+	{
+	    local $/ = "\0";
+	    $afn = <FILE>;
+	    chomp $afn;
+	    $vec = <FILE>;
+	    chomp $vec;
+	}
+	
+	my ($size, $hash, $sizedate, $hashdate, $deldate ) = split ":", $vec;
+	
+	# mark each hash in the snapshot as occuring zero times to start
+	$seenHashes{$hash} = 0;
+
+	# record each filename that matches this hash for later reporting
+	push @{$hashToAfn{$hash}}, $afn;
+
+	$count++;
+    }
+
+    print "Found $count record in snapshot [$fn]\n";
+
+
+    print "[[[ Beginning scan of listed files\n";
+
+    my $fi = new FileIterator( @filearg );
+    while( my $fn = $fi->getNext() )
+    {
+	my $afn = File::Spec->rel2abs( $fn ) ;
+
+	next unless -f $afn;
+	debug "Scanning $afn";
+	
+	my $hash = getChecksum( $afn );
+
+	$seenHashes{$hash}++;
+    }
+
+    print "]]] Ending scan of listed files\n";
+
+    reportmain "The following files from the snapshot can not be reconstructed from the listed files\n";
+
+    foreach my $k (keys %seenHashes)
+    {
+	if( $seenHashes{$k} < 1 )
+	{
+	    foreach my $afn (@{$hashToAfn{$k}})
+	    {
+		reportmain "$afn\n";
+	    }
+	}
+    }
+
+    reportmain "\n";
+    reportmain "The following files from the snapshot CAN reconstructed from the listed files:\n";
+
+    foreach my $k (keys %seenHashes)
+    {
+	if( $seenHashes{$k} >= 1 )
+	{
+	    foreach my $afn (@{$hashToAfn{$k}})
+	    {
+		reportmain "$afn\n";
+	    }
+	}
+    }
+}
+
+### Testing only, oK to remove
+
+## Note: rel2abs is VERY VERY SLOW, use sparingly. It is far slower that any parse, databse lookup or stat.
+
+elsif( $op eq "perftest" )
+{
+    find( { no_chdir => 1,
+	    wanted => 
+		sub 
+	    {	
+		my $fn = $File::Find::name;
+#		my $afn = File::Spec->rel2abs( $fn ) ;
+		print "$fn\n";
+	    }}, @fileargABS );    
+}
+
+
+elsif( $op eq "dbspeedtest" )
+{
+
+    my $fn = "/Volumes/Drobo03/Pre-Jun20-2009/Photos/2007-B/boston-hsq-sloan-city-fall-2007/master-rejects/hsq-071210-00006.CR2";
+
+    my $r = refreshAFN( "/Volumes/Drobo03/Pre-Jun20-2009/Photos/2007-B/boston-hsq-sloan-city-fall-2007/master-rejects/hsq-071210-00006.CR2", 10,10,10);
+
+    my $i;
+
+ my $START_GTOD = [gettimeofday];
+    for( $i = 0; $i < 10000000 ; $i++ )
+    {
+
+	$afnToAssetRecord{$fn.$fn.$i} = $r x 2;
+	
+	if( $i % 10000 == 0)
+	{
+	    debug( "$i -- " . tv_interval( $START_GTOD )*1_000_000  );
+	    $START_GTOD = [gettimeofday];
+	}
+    }
+
+
+
+
+    for( $i = 0; $i < 100000 ; $i++ )
+    {
+	$START_GTOD = [gettimeofday];
+	$r = $afnToAssetRecord{$fn.$i};
+	debug( "$i -- " . tv_interval( $START_GTOD )*1_000_000  );
+    }
+
+    debug( "TIME: After retrieval of dirent cache: " . tv_interval( $START_GTOD )*1_000_000  );
+
+
+}
+
+
+## countdup -- for each file selected, prints the number of instances of that exact file
+## within the entire set. Uses FSE.
+
+elsif( $op eq "countdup" )
+{
+    my $fse = new FileSetExplorer::RealFiles();
+    $fse->setPaths( @filearg );
+    $fse->loadSizeCache();
+
+    while( my $fn = $fse->getNext() )
+    {
+	next unless -f $fn;
+
+	my @afns = $fse->getDuplicates( $fn );
+
+	my $count = scalar @afns;
+
+	printf "%-3d %s\n", $count, $fn;
+
+    }
+}
+
+elsif( $op eq "dbstress" )
+{
+ 
+    for(my $i = 0 ; $i < 1_000_000 ; $i++  )
+    {
+	discover_file( "/this/is a very long/file $i with lots/$i/$i of randomness/$i/$i$/$i/sdkfj sdlkfj sldk jsdlkfj sdlkfjsd lkfjsdfsdlfkj sdlfkj sdf sdkflj/sdflsdkjflsdkjf / sldkhjflsdkjf /dsfkjsdflkjsdlfk/sdfkjsdfkljsdf/sdfljksdflkjsdfkj/sdfjkhsdfsdfjkd/$i/$i",
+		       833828383, 
+		       "sdkfljslkfjlsr9lkxzdjff",
+		       234234234,
+		       234234342333,
+		       undef,
+		       "sdfsdfser34sefse3fsefsf32sdfsdfsdf",
+		       213423423423,
+		       8121 );
+	
+	if( $i % 100 == 0 )
+	{
+	    printf( "Record $i %u\n", -s "$WDIR/afn-to-hash.db")
+	}
+	
+    }
+    
+}
+
+
+elsif( $op eq "queryhash" )
+{
+    
+
+}
+
+## Creates a simple text file, one line for each file in the named set, with the format size + tab + filename
+
+elsif( $op eq "genstatfile" )
+{
+    my $fi = new FileIterator( @filearg );
+    while( my $fn = $fi->getNext() )
+    {
+	next unless -f $fn;
+
+	my $size = -s $fn;
+
+	report "statfile-$$.txt", "$size\t$fn\n";
+    }
+
+}
+
+
+elsif( $op eq "checkfree" )
+{
+    my $fs = getFreeSpace( shift @filearg );
+    print "Free space: $fs\n\n";
+}
+
+elsif( $op eq "lspriorities" )
+{
+    my %priorities;
+    my $tot = 0;
+    my $fi = new FileIterator( @filearg );
+    while( my $fn = $fi->getNext() )
+    {
+	next unless -f $fn;
+	
+	my $pri = prioritizeFN( $fn);
+	my $size = -s $fn;
+	$tot+=$size;
+	$priorities{$pri} += $size;
+	my $l = sprintf( "%2dpri %8.1fmb %s\n",  $pri, $size /1024/1024, $fn);
+	reportmain $l;
+	report "lspriority-$$-listing.txt", $l;
+    }
+    my $cum;
+    foreach my $k ( reverse sort {$a <=> $b} keys %priorities )
+    {
+	my $s = int($priorities{$k} / 1_000_000);
+	$cum+=$s;
+	my $pct = $priorities{$k} / $tot * 100;
+	my $line = (sprintf ("%02d - %8d MB (%4.1f%%) %9d MB %s\n", $k, $s, $pct, $cum, "x" x ($pct/1)));
+	reportmain $line;
+	report "lspriority-$$-histogram.txt", $line;
+    }
+
+}
+
+elsif( $op eq "prioritize" )
+{
+    while( <> )
+    {
+	chomp;
+	my $p = prioritizeFN( $_ );
+	print "$p - $_\n";
+    }
+}
+
+elsif( $op eq "prioritizestatfile" )
+{
+    my %priorities;
+    my $tot = 0;
+    while( <> )
+    {
+	chomp;
+	my( $s, $fn) = split "\t";
+	my $p = prioritizeFN( $_ );
+	report "priority-by-file-$$.txt","$p - $_\n";
+	$tot+= $s;
+	$priorities{$p} += $s;
+    }
+    my $cum;
+    foreach my $k ( reverse sort {$a <=> $b} keys %priorities )
+    {
+	my $s = int($priorities{$k} / 1_000_000);
+	$cum+=$s;
+	my $pct = $priorities{$k} / $tot * 100;
+	my $line = (sprintf ("%02d - %8d MB (%4.1f%%) %9d MB %s\n", $k, $s, $pct, $cum, "x" x ($pct/1)));
+	reportmain $line;
+	report "priority-histogram-$$.txt", $line;
+    }
+
+}
+
+
+# Writes out files in the listed directory not found in the assure database'
+
+elsif( $op eq "fastbackup" )
+{
+    my $targetDir = pop @filearg;
+
+    my %inCopy;
+
+    my $BACKUPZEROFILE = "zz-fastbackup-$$-zeroterm.txt";
+
+    my $targetFse = new FileSetExplorer::RealFiles();
+    $targetFse->setPaths( $targetDir );
+    $targetFse->loadSizeCache();
+    
+    my $bytes = 0;
+
+    my( $total, $used, $avail) = getFreeSpace($targetDir);
+
+    if( $FILLMODE )
+    {
+	my $limit = int($total * 0.97);
+	$maxSize = 0 if( $used > $limit);
+
+	$maxSize = $limit - $used;
+    }
+	
+    my %priorities;
+    my %priInclude; # not used yet
+    my %priExclude;
+
+
+    print "Maxsize setting: $maxSize\n";
+
+    my $fi = new FileIterator( @filearg );
+    while( my $fn = $fi->getNext() )
+    {
+	next unless -f $fn;
+	
+	next if $fn eq '.pcip_info';
+
+	if((defined $maxSize ) and ($bytes >= $maxSize ))
+	{
+	    reportmain (" --- max size reached, stopping\n");
+	    last; 
+	}
+
+	
+#	reportmain ( "ity >= $PRIORITY_SETTING) - $fn\n");
+
+	my $avoid = 0;
+	my $hash = getChecksum( $fn );
+	my $size = getSize( $fn );
+	if ($inCopy{$hash})
+	{
+
+	reportmain ( "copies:[xx] pri:(xx >= $PRIORITY_SETTING) - $fn\n");
+
+	    reportmain (" --- skipping, already copied this hash in this session\n");
+	    next;
+	}
+
+	my $priority;
+
+	if (defined $PRIORITY_SETTING)
+	{
+	    $priority = prioritizeFN( $fn );
+
+	    if( $priority < $PRIORITY_SETTING )
+	    {
+		
+		reportmain ( "copies:[xx] pri:($priority >= $PRIORITY_SETTING) - $fn\n");
+		report( "zz-fastbackup-$$-prioritytoolow.txt", "$fn\n" );
+		reportmain (" --- skipping, priority too low( $priority < $PRIORITY_SETTING )\n");
+		next;
+	    }
+	}
+
+
+	
+	$inCopy{$hash}++;
+
+#	debug " ";
+#	debug "   Size: $size Hash: $hash";
+
+	my @fvs = $fvDB->getWithHash( $hash );
+	my $c= 0+@fvs;
+
+
+	my $l = 		    sprintf( "c:[%2d] pri:(%2d>=%2d) %6.1fmb %7.1fmb %s\n",
+					     $c,
+					     $priority,
+					     $PRIORITY_SETTING,
+					     $size / 1024 / 1024,
+					     $bytes / 1204 / 1024,
+					     $fn);
+	
+	reportmain ( $l );
+	
+	if( $c == 0)
+	{  
+	    report( $BACKUPZEROFILE, "$fn\0" );	    
+
+	    $bytes+= $size; 
+	    $priorities{$priority} += $size;
+
+	    report( "zz-fastbackup-$$-fullreport.txt", $l);
+
+	}
+
+   }
+
+
+    reportmain ("DOne with scan\n");
+
+
+    my $cum;
+    foreach my $k ( reverse sort {$a <=> $b} keys %priorities )
+    {
+	my $s = int($priorities{$k} / 1_000_000);
+	$cum+=$s;
+	my $pct = $priorities{$k} / $bytes * 100;
+	my $line = (sprintf ("%02d - %8d MB (%4.1f%%) %9d MB %s\n", $k, $s, $pct, $cum, "x" x ($pct/1)));
+	reportmain $line;
+	report "zz-fastbackup-$$-priority-histogram.txt", $line;
+    }
+
+
+
+    my $date = `date +%Y%m%d-%H%M%S`;
+    chomp $date;
+
+    my $dest = "$targetDir/backup-$date";
+    main::mkdirs( $dest );
+
+    my @CMD = ('rsync', '-av0', '--files-from=' . $BACKUPZEROFILE,  "/" , $dest . "/" );
+
+    reportmain @CMD;
+
+    print "I'd like to execute:" . ((join ' ', @CMD)) . "\n";
+
+
+    if( $execute )
+    {
+	
+	reportFlush();
+	
+	my $res = system( @CMD );
+	
+	if( $res != 0 )
+	{
+	    print "EXECUTE FAILED:$!,$? @CMD\n";
+	}
+	
+#	unlink $MAINREPORTNAME;
+	# unlink $BACKUPZEROFILENAME;
+   #    unlink $BACKUPZEROFILENAMEREL;
+
+
+
+    my $fi = new FileIterator( $targetDir );
+
+    my $str = POSIX::strftime( "%Y%m%d%H%M%S", gmtime($NOW) );
+
+    my $name = "snapshot";
+    $name = "$VAULT_NAME" if( $VAULT_NAME );
+    
+    my $snapFN = "$targetDir/$name-$str.pc";
+
+    my $START_GTOD_MAIN = [gettimeofday];
+    my $i;
+
+    while( my $fn = $fi->getNext() )
+    {
+	my $START_GTOD = [gettimeofday];
+	$i++;
+	
+	my $afn = File::Spec->rel2abs( $fn ) ;
+	my $t = -f $afn ? "FILE:" : " DIR:";
+
+
+	reportmain( "SNAPSHOT: $fn\n");
+
+
+	next unless -f $afn;
+	next if basename($fn) eq  '.pcip_info';
+
+	$count_targetFilesProcessed++;
+	my $ar = writeAFNtoSnapshot( $afn, $snapFN );
+
+
+
+	writeInPlace( $afn, $ar );
+	
+
+	my $hash = $ar->hash();
+	my $size = $ar->size();
+	my $fn = $ar->fn();
+
+
+	my @fvs = $fvDB->getWithHash( $hash );
+	my $c= 0+@fvs;
+	reportmain ( "c[$c] - $fn\n");
+	if( $c == 0)
+	{  
+
+	    reportmain "Registration: $fn hash:$hash size:$size - $i total\n";
+	    
+
+	    $fvDB->registerFileVersion( -Type          => 'Vault',
+					-Afn           => $ar->fn(),
+					-Size          => $ar->size(),
+					-SizeDate      => $ar->sizedate(),
+					-FastHash      => $ar->fasthash(),
+					-FastHashDate  => $ar->fasthashdate(),
+					-FastHashDepth => $ar->fasthashdepth(),
+					-Hash          => $ar->hash(),
+					-HashDate      => $ar->hashdate(),
+					-RegistrationDate    => $NOW,
+					-VaultName     => $name,
+					-Source        => $afn );
+
+	}
+
+	reportmain("\n\n\n");
+}
+
+
+
+    }
+    else
+    {
+	reportmain( "Execute not set, no action taken.\n");
+	reportmain( "\n\n\n****************************\n");
+	reportmain ("Try: rsync -av0 --files-from=$BACKUPZEROFILE\n");
+	reportmain( "****************************\n");
+    }
+
+
+
+
+
+
+}
+
+
+
+# Ls is used to interrogate the main database to list out 
+# known data about files. This is working live code as of 12/25/2009
+# Ls is intended to give "quick" results that won't press a lot of new computation
+# on other files. In the worst case, it will require a checksum
+# of the current listed files only.
+
+elsif( $op eq "ls" )
+{
+    my $source = new FileSetExplorer::RealFiles();
+    $source->setPaths( @filearg );
+    $source->loadSizeCache();
+
+    my $fi = new FileIterator( @filearg );
+
+    debug "ready!";
+
+
+	reportmain "# of files | total size M | files to back up | bytes to back up M | percent backed up | filename \n";
+
+    while( my $fn = $fi->getNext() )
+    {
+
+	my $dirent = DirectoryEntry->retrieve( $fn );
+
+	if( $dirent )
+	{
+
+	    my $oFileCount = $dirent->count();
+	    my $oSize = $dirent->size() / 1000000;
+	    my $bc = $dirent->bakCount();
+	    my $bb = $dirent->bakBytes() / 1000000;
+
+	    my $pbu = 100 - ($bb / $oSize*100);
+
+
+
+	    printf "%-6d %10.2f  %-5d %10.2f %4.0f%% %s\n", $oFileCount, $oSize, $bc, $bb, $pbu, $fn; 
+
+
+	}
+
+
+
+
+
+
+
+
+
+
+
+	next unless -f $fn;
+
+
+
+	my $hash = getChecksum( $fn );
+	my $size = getSize( $fn );
+
+	debug " ";
+#	debug "   Size: $size Hash: $hash";
+
+	my @fvs = $fvDB->getWithHash( $hash );
+
+	foreach my $fv (@fvs )
+	{
+#	    debug( "FV= $fv" );
+
+	    my $source = $fv->source();
+	    my $type = $fv->type();
+	    my $vaultName = $fv->vaultName();
+	    my $id = $fv->id();
+
+	    reportmain( "   Match:  $id" );
+	    reportmain( "           (vault:[$vaultName] source:[$source])" );
+	}
+
+
+	debug " ";
+    }
+
+}
+
+
+
+## backup <target> <files>  -I <snapshot>
+##
+## copies files from source -> target that do not already exist somewhere in target
+## this is in effect, a minimalist backup
+## also, creates a snapshot of listed files that is copied into the target
+## the "ignore" switch will not copy over anything in that is referenced by the listed snapshot
+
+
+# my $targetfs = new fileset:frompath( $target)
+# my $targetfse = new fse( $targetfs );
+# my $sourcefs = new fileset::frompath( $source );
+# my sourcefse = new fse( $sourcefs);
+#
+# while( $f = $sourcefsee->getNext() )
+#    print explrong file $f
+#    if( not $targetfs->hasHashInSet( $f->getHash() )
+#        if( not $ignorefse->hasSameFileInSet( $f );
+#              # copy it over
+#              $targetfs->makeBackup( $fn ); # finds a place somewhere to receive this copy
+#    # write snapshot out
+#   
+
+
+
+
+elsif( $op eq "backup" )
+{
+    my $targetDir = shift @filearg;
+
+    my $targetFse = new FileSetExplorer::RealFiles();
+    $targetFse->setPaths( $targetDir );
+    $targetFse->loadSizeCache();
+
+    my $source = new FileSetExplorer::RealFiles();
+    $source->setPaths( @filearg );
+#    $source->loadSizeCache();
+
+
+    my $aux = new FileSetExplorer::RealFiles();
+    $aux->setPaths( @AUXPATH );
+    $aux->loadSizeCache();
+
+    my $snaps = new FileSetExplorer::Snapshots();
+    $snaps->setPaths( @SNAPSHOTS );
+    $snaps->loadSizeCache();
+
+    my $date = `date +%Y%m%d-%H%M%S`;
+    chomp $date;
+
+    my %agentForDev;
+
+    my $fi = new FileIterator( @filearg );
+    
+    debug( "Starting run" );
+
+    my $BACKUPZEROFILENAME = "PC-backups-needed-zeroterm-$$.txt";
+    my $BACKUPZEROFILENAMEREL = "PC-backups-needed-zeroterm-rel-$$.txt";
+
+
+    my $filecount = 0;
+    my $onsnapshot = 0;
+    my $ondrive = 0;
+    my $backneedcount = 0;
+
+    while( my $fn = $fi->getNext() )
+    {
+	next unless -f $fn;
+
+	$filecount++;
+
+	if( $PHOTO_MODE )
+	{
+	    next if $fn =~ /\.fseventsd/;
+	    next if $fn =~ /\.Trashes/;
+	}
+	
+	## getDuplicates() is going to force a tree descent to enumerate all sizes.
+	
+	
+	my @afns = $targetFse->getDuplicates( $fn );
+
+	my $count = scalar @afns;
+
+#	printf "%-3d %s\n", $count, $fn;
+	
+	reportmain "----- $fn\n";
+
+	map {reportmain "  atDestAlready > $_\n" } @afns;
+
+
+	
+	my @auxFns = $aux->getDuplicates( $fn );
+	if( @auxFns > 0 )
+	{
+	    # print "Auxiliary copy found, SKIPPING. Full list here:\n";
+	    map {reportmain "   atAuxAlready > $_\n" } @auxFns;
+	    reportmain "   Final action: Skip (present in auxiliary directory)\n";
+	    $ondrive++;
+	    next;
+	}
+
+	my @snapsFns = $snaps->getDuplicates( $fn );
+	if( @snapsFns > 0 )
+	{
+	    # print "Auxiliary copy found, SKIPPING. Full list here:\n";
+	    map {reportmain "   atSnapAlready > $_\n" } @snapsFns;
+	    reportmain "   Final action: Skip (present in listed snapshot)\n";
+	    $onsnapshot++;
+	    next;
+	}
+	
+	# check if a copy is needed and make one
+
+	if( $count < 1 )
+	{
+	    $backneedcount++;
+	    my $src = $fn;
+
+	    # Do a stat mainly to get the device ID
+
+	    my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,
+                      $atime,$mtime,$ctime,$blksize,$blocks)
+		= stat($fn);
+	    
+
+	    # pathtag lookup works, but shut off for now
+	    
+	    my $pathtag = ""; # getPathTag( $src );
+	    my $dest = "$targetDir/backup-$date$fn";
+
+	    reportmain "COPY\n";
+	    reportmain "  SRC: $src\n";
+	    reportmain " DEST: $dest\n";
+
+#	    report( "PC-backups-needed-newline-$$", "$src\n" );
+
+	    my $rel = File::Spec->abs2rel( $src );
+
+	    report( $BACKUPZEROFILENAME, "$src\0" );	    
+	    report( $BACKUPZEROFILENAMEREL, "./$rel\0" );	    
+
+	    if( $PHOTO_MODE )
+	    {
+		$dest =~ s/Volumes\//V-/;
+		$dest =~ s/EOS_DIGITAL([^\/]*)\//EOS-/;
+		$dest =~ s/CANON_DC\//CDC-/;
+		$dest =~ s/DCIM\///;
+
+		print "PHOTO MODE DEST NOW: [$dest]\n";
+	    }
+
+#	    my $fca = $agentForDev{$dev};
+#	    if( not defined $fca )
+#	    {
+#		$fca = new FileCopyAgent();
+#		$agentForDev{$dev} = $fca;
+#	    }
+	   
+#	     $fca->add( $src, $dest, $size );
+#	    mkdirs( $dest );
+#	    copy( $src, $dest ) or die "Copy failed: $!\n";
+	}
+    }
+    
+    foreach my $fca (values %agentForDev)
+    {
+	$fca->closeQueue();
+    }
+
+    foreach my $fca (values %agentForDev)
+    {
+	$fca->wait();
+    }
+
+
+    my $dest = "$targetDir/backup-$date";
+    main::mkdirs( $dest );
+
+    my @CMD = ('rsync', '-av0', '--files-from=' . $BACKUPZEROFILENAMEREL,  "./" , $dest . "/" );
+
+    print ((join ' | ', @CMD), "\n");
+
+    if( $execute )
+    {
+	
+	reportFlush();
+	
+	my $res = system( @CMD );
+	
+	if( $res != 0 )
+	{
+	    print "EXECUTE FAILED:$!,$? @CMD\n";
+	}
+	
+	
+	
+	
+	unlink $MAINREPORTNAME;
+	unlink $BACKUPZEROFILENAME;
+   #    unlink $BACKUPZEROFILENAMEREL;
+	
+    }
+    
+
+    reportmain "Total files in set: $filecount\n";
+    reportmain "Files already at destinations: $ondrive\n";
+    reportmain "Files found in listed snapshots: $onsnapshot\n";
+    reportmain "Files needing backups: $backneedcount\n";
+
+
+
+}
+
+
+
+
+
+## rsync_old <source1> <source2> <target>  -I <snapshot> -A auxiliaryPath -O <orphan path>
+##
+#### NOTE: this works in a very very limited way to make "winkins". it is not efficient, and should be closely monitored
+##
+## The tool will look as much as possible for the best source to use in constructing the destination.
+## If the source is available within the listed path, it will be copied from that location unless
+## it is otherwise orphaned.  Orphaned means that the file exists at the destination but no longer
+## is placed the same way in the source. An orphaned file will be "winked in" from such a location through
+## a move operation rather than a copy. The tool prefers first to copy from the source. However, if sources
+## are not listed, the tool instead resorts to any file it can get its hands on based on its hash database.
+
+## OK - Destination file is "OK" - a hash duplicate of the matching file at the source
+## DESTMOVE - Destination file is some other file and needs to move out of the way
+## IGNORE - On an ignore list - either the aux path, or the snapshot list
+## WINKIN - A hash duplicate can be found, but not at the right place
+## NOVO - File is truely "de novo" file not present anywhere at the destination
+
+
+## This should be rewritten to make value right away on an rsync problem - hit low hanging fruit first
+## Also, we need one big loop stuck around the outside to handle each source directory separately. seems to be the only
+## good way to get the actual path we need.
+## 
+## The UNUX Rsync's behavior is this: rsych /a/b/c /d/e/f is to create a /d/e/f/c directory, meaning we have to pull the "c" off of the source path.
+
+
+## Scan all sources, just get the paths into a hash that don't seem to exist at all in the destination
+## do a fast descent around the second tree, get the size only
+## for each source in that list, getDuplicates() and screen out all those that don't have filenames for the final destination
+## now i have a list of orphans, wink one of them in and mark it as a future exclude
+## no second descent around the destination tree needed at all here.. let rsync take care of that
+
+
+
+
+
+
+
+elsif( $op eq "rsync_OLD" )
+{
+    my $targetDir = pop @filearg;
+
+    $targetDir =~ s/\/+$//;
+
+    my $targetFse = new FileSetExplorer::RealFiles();
+    $targetFse->setPaths( $targetDir );
+    $targetFse->loadSizeCache();
+
+    my $sourceFse = new FileSetExplorer::RealFiles();
+    $sourceFse->setPaths( @filearg );
+
+    my $aux = new FileSetExplorer::RealFiles();
+    $aux->setPaths( @AUXPATH );
+    $aux->loadSizeCache();
+
+    my $orphanFSE = new FileSetExplorer::RealFiles();
+    $orphanFSE->setPaths( @ORPHANPATH );
+    $orphanFSE->loadSizeCache();
+
+    my $ignoreSnap = new FileSetExplorer::Snapshots();
+    $ignoreSnap->setPaths( @SNAPSHOTS );
+    $ignoreSnap->loadSizeCache();
+
+    my $date = `date +%Y%m%d-%H%M%S`;
+    chomp $date;
+
+    my %agentForDev;
+
+    my $fi = new FileIterator( @filearg );
+    
+    debug( "Starting run" );
+
+    my $BACKUPZEROFILENAME = "PC-backups-needed-zeroterm-$$.txt";
+    my $BACKUPZEROFILENAMEREL = "PC-backups-needed-zeroterm-rel-$$.txt";
+
+    my $filecount = 0;
+    my $onsnapshot = 0;
+    my $ondrive = 0;
+    my $backneedcount = 0;
+
+    my %orphan;
+    my %claim;
+
+    my %neededForWinkin;
+
+
+    my %srcStatus;
+    my %destStatus;
+    my %destPathForSource;
+
+    my @copyActions;
+
+    ### First, we do a decent around the entire SOURCE. For each file we find,
+    ### our goal is to find a match in the destination if at all possible.
+    ### assign a source status, and a destination status based on what we find
+
+    ## The orphan hash contains a list of all orphans with their intended new paths as the result of the hash
+
+    while( my $fn = $fi->getNext() )
+    {
+	next unless -f $fn;
+
+	$filecount++;
+
+	if( $PHOTO_MODE )
+	{
+	    next if $fn =~ /\.fseventsd/;
+	    next if $fn =~ /\.Trashes/;
+	}
+	
+	reportmain "++++ ----- Considering SOURCE FILE for sync [$fn]\n";
+
+	## Calculate the source and destination paths
+	
+	my $src = $fn;
+	my $rel = File::Spec->abs2rel( $src );
+
+	
+
+	my $dest = "$targetDir/$rel";
+	print "SRC: $rel\n";
+	print "DEST: $dest\n";
+
+	
+	my $srcAFN = File::Spec->rel2abs( $src );
+	my $destAFN = File::Spec->rel2abs( $dest );
+
+	$destPathForSource{$src} = $destAFN; # LAZY, could be recomputed later
+
+	## Decide if there is a file there already? If so, good idea to mark
+	## the orphan that needs to moved out
+
+	my $actionNeeded = 0;
+
+	$srcStatus{$src} = 0;
+
+	if( -e $dest )
+	{
+	    # File exists at dest, is it the right one?
+	    
+	    my $identical = testIdentical( $srcAFN, $destAFN );
+	    if( $identical )
+	    {
+		print "Existing file present, checksums match\n";
+		$actionNeeded = 0;
+		#$claim{$destAFN} = $srcAFN;
+		$srcStatus{$srcAFN} = "OK";
+		$destStatus{$destAFN} = "OK";
+	    }
+	    else
+	    {
+		print "Potential future orphan detected: $dest\n";
+		
+		$destStatus{$destAFN} = "DESTMOVE";
+
+		# Mark this newly found orphan as not being claimed 
+		#$orphan{$dest} = undef; 
+
+		$actionNeeded = 1;
+	    }
+
+	}
+	else
+	{
+	    $actionNeeded = 1;
+	}
+
+
+
+	my @auxFns = $aux->getDuplicates( $fn );
+	if( @auxFns > 0 )
+	{
+	    # print "Auxiliary copy found, SKIPPING. Full list here:\n";
+	    map {reportmain "   atAuxAlready > $_\n" } @auxFns;
+	    reportmain "   Final action: Skip (present in auxiliary directory)\n";
+	    $ondrive++;
+
+	    $srcStatus{$srcAFN} = "IGNORE";
+	    $destStatus{$destAFN} = "IGNORE";
+
+	    next;
+	}
+
+	my @snapsFns = $ignoreSnap->getDuplicates( $fn );
+	if( @snapsFns > 0 )
+	{
+	    # print "Auxiliary copy via snapshot found, SKIPPING. Full list here:\n";
+	    map {reportmain "   atSnapAlready > $_\n" } @snapsFns;
+	    reportmain "   Final action: Skip (present in listed snapshot)\n";
+	    $onsnapshot++;
+
+	    $srcStatus{$srcAFN} = "IGNORE";
+	    $destStatus{$destAFN} = "IGNORE";
+
+	    next;
+	}
+
+	### If we are here, we still need to decide if this is a NOVO or a WINKIN.
+	### First, check for things in the orphan path
+
+	if( $actionNeeded )
+	{
+	    ## Preference is an unclaimed file in an orphan path, because most
+	    ## likely that could be handled with a rename operation, the most efficient possible.
+	    ## The user can provide a path where orphans can be found. 
+	    
+	    reportmain "Checking for user specified orphans that could be a match\n";
+	    
+	    my @orphanFns = $orphanFSE->getDuplicates( $srcAFN );
+	    if( @orphanFns > 0 )
+	    {
+		map {reportmain "   Orphan > $_\n" } @orphanFns;
+		reportmain "   Final action: Skip (present in listed snapshot)\n";
+	    }
+	    
+	    foreach my $p ( @orphanFns ) 
+	    {
+		my $orphanTaken = defined $claim{$p};
+		
+		print " - Orphan $p is a duplicate - taken=[$orphanTaken]\n";
+		
+		if( not $orphanTaken )
+		{
+		    $orphan{$p} = $dest;
+		    
+		    $srcStatus{$srcAFN} = "WINKIN";
+
+		    $neededForWinkin{$p}++;
+
+# is claiming needed now?
+#print " - CLAIMING $p to $dest\n";
+		    #$claim{$p} = $destAFN;
+		    
+		    $actionNeeded = 0;
+		    last;
+		}
+	    }
+	    
+	}
+
+
+	if( $actionNeeded)
+	{
+
+	    ### Now we need to decide if this is a NOVO or a WINKIN
+	    
+	    ## getDuplicates() is going to force a tree descent to enumerate all sizes.	
+	    
+	    my @afns = $targetFse->getDuplicates( $fn );
+	    my $count = scalar @afns;
+	    map {reportmain "  atDestAlready > $_\n" } @afns;
+	    
+	    if( @afns > 0 )
+	    {
+		reportmain " - COPY DOES EXIST AT DESTINATION\n";
+
+		map 
+		{
+		    reportmain "   copies at dest> $_\n";
+		    $neededForWinkin{$_}++;
+		    
+		} @afns;
+
+		$srcStatus{$srcAFN} = "WINKIN";
+
+	    }
+	    else
+	    {
+		$srcStatus{$srcAFN} = "NOVO";
+
+	    }
+    
+	}
+
+
+
+	reportmain( "Final Status for source: $srcStatus{$srcAFN}\n");
+
+	die "assert error" unless (($srcStatus{$srcAFN} eq "OK") or
+				   ($srcStatus{$srcAFN} eq "NOVO") or
+				   ($srcStatus{$srcAFN} eq "WINKIN") or
+				   ($srcStatus{$srcAFN} eq "IGNORE")); 
+	
+
+
+    }
+    
+    # Now we have to see if there homes for all files in the destination directory
+    # Ask the FSE to give us everything in there
+    # if a file in the FSE has not been claimed, we need to invent a new place for it to go. 
+    # see if anything in the source needs it. Then assign it to move, and clear out the requirement for the copy. 
+ 
+    ### THE ABOVE PART NOT DONE YET
+
+    my $fi = new FileIterator( $targetDir );
+    while( my $fn = $fi->getNext() )
+    {
+
+	reportmain "----- Checking DESTINATION paths [$fn]\n";
+
+	next unless -f $fn;
+
+	## A destination file needs to be either
+	## OK - fine as is
+	## USELESS - bits we no longer need anywhere in the destination tree
+	## ORPHAN - bits we need, but currently not in the right place
+
+	my $di = $destStatus{$fn};
+
+	if( $di eq "OK" )
+	{
+	    reportmain "  - file is in the right place already\n";
+	}
+	else
+	{
+	    # This is either a destmove, or wasn't encountered originally.
+	    # Classify as ORPHAN if needed
+
+	    my $c=$neededForWinkin{$fn};
+	    
+	    reportmain "  - claims for winkins: $c\n";
+	    
+	    if( $c > 0 )
+	    {
+	        $di = "ORPHAN";		
+	    }
+	    else
+	    {
+		$di = "USELESS";		
+	    }
+	}
+	
+	$destStatus{$fn} = $di;
+	reportmain "  - DEST STATUS: $di\n";
+
+    }
+
+    # At this point, we have status assigned to all sources and destinations, so we need to start taking
+    # action. Straightforward renames are by far the most useful thing to do. First, lets get rid of all
+    # of the "useless" guys.
+
+    foreach (keys %destStatus)
+    {
+	my $destAFN = $_;
+
+#	print "$destAFN -> $destStatus{$destAFN}\n";
+
+	if( $destStatus{$destAFN} eq 'USELESS' )
+	{
+	    reportmain "useless: $destAFN\n";
+
+	    ######## NO ACTION
+	}
+    }
+
+    # Lets look for opportunist renames
+
+    
+
+    # this next part is not the best way. Best way = coordiante by hash and make sure you
+# do the exact minumum number of copies or moves as needed
+
+    my %markedForMove;
+
+    foreach (keys %srcStatus)
+    {
+	my $srcAFN = $_;
+
+	if( $srcStatus{$srcAFN} eq 'WINKIN' )
+	{
+	    reportmain "HANDLE WINKIN: $srcAFN\n";
+
+	    my @afns = $targetFse->getDuplicates( $srcAFN );
+	    my $count = scalar @afns;
+
+	    ## Make sure we don't take the last orphan! This doesn't matter here b/c this is version 0.0001 and we just take one and then move on
+	    
+	    my @matchesInPlace;
+	    my @matchesOrphaned;
+
+	    foreach my $destAFN (@afns)
+	    {
+		my $destStatus = $destStatus{$destAFN};
+		reportmain "  destCopy > $destAFN - $destStatus\n";
+		next if $markedForMove{$destAFN};
+		push @matchesInPlace, $destAFN if $destStatus eq 'OK';
+		push @matchesOrphaned, $destAFN if $destStatus eq 'ORPHAN';
+ 	    }
+
+	    # First, we prefer orphans
+	   
+	    if( @matchesOrphaned > 0 )
+	    {
+
+	    my $destAFN = pop @matchesOrphaned;
+
+	    $markedForMove{$destAFN} = 1;
+
+	    my $newLoc = $destPathForSource{$srcAFN};
+	    
+	    report( "ZZ-Winkins$$.txt", "[$destAFN] -> [$newLoc]\n" );
+
+	    #mkdirs $newLoc;
+	    #rename $destAFN, $newLoc;
+
+	    }
+
+
+	    ######## NO ACTION
+	}
+    }
+
+
+    
+    
+    
+    reportmain "Total files in set: $filecount\n";
+    reportmain "Files already at destinations: $ondrive\n";
+    reportmain "Files found in listed snapshots: $onsnapshot\n";
+    reportmain "Files needing backups: $backneedcount\n";
+
+}
+### implemented jan2012
+### rsync Source1 source2 target --spares=foobar/directory --fast/-f --nocopy --execut
+###
+### This version is intended to be a well written replacement rsync -- rearranging the files
+### anywhere in the target as an alternative to copying the file whenever possible.  This
+### implementation is the cleanest and most advanced of the "rsync replacements" in powercut, and
+### has been tested fairly extensively. In fact, the program will print out an rsync statement at
+### the end that the user can optionally invoke to verify its work.  It is much more intelligent
+### about using relative paths than the rest of powercut, and tries to mimic the exact semantics of
+### the rsync command's use of relative paths. However, it does differ from rsync in that it will
+### prefer "winkins" to actual copies if it can get away with making a local substitution. It also
+### has "backup mode" permanently on, meaning that it never deletes files, it just moves them to a
+### "backup-xxxx" directory rooted at the target.
+###
+### Note: Anything inside the target directory is considered "fair game" for winkin behavior, so for
+### instance if you sync dira/dirb/ to dirz/, the contents of dirb/ will be placed at dirz/dirb,
+### however wink-ins will be allowed from anywhere in the dirz/ subtree.
+###
+### You can specify additional paths called "spares" that winkins will be drawn from. This will
+### become a preferred source for winkin behavior. This use of --spares is tested, but
+### prioritization of multiple winkin candidates is not currently implemented.
+###
+### --nocopy means that only winkins and orphan removals are made.. useful if you wantto use as a
+###   preprocessor to rsync
+###
+### --execute is respected. If not present, no actual changes to the filesystem are made. Care has
+###   been taken so that the output without --execute will closely match that of the actual run,
+###   however there is one known exeception where there will be a mismatch. If there is an orphan in
+###   the destination tree (e.g. has no countepart in the source) that actually ends up being a
+###   valid wink-in, it will be queued to a new home during pass 1. If execute mode is off, this
+###   orphan will be incorrectly flagged for movement to a backup directory in pass 2 since pass 2
+###   does not check the actions proposed by pass 1.
+###
+### --fast is recommended. It will avoid the otherwise intensive effort of full checksuming as part
+###   of normal use, and is the best choice unless the user thinks there is a serious risk that
+###   winkins may have suffered bitrot or inplace edits that did not affect their sizes. If not
+###   applied, every file already in sync will get a full checksum request, and this will
+###   substantially drive up processing time if the checksum caches are not up to date. The --fast
+###   flag will influence two things when active: first, getDuplicates is universally affected when
+###   --fast is on, and this function is used to find candidates for winkins.  In --fast,
+###   getDuplicates() will deem a duplicate exists, and thus a winkin is available, if sizes and
+###   fasthashes match.  Secondly, for rsync mode only, special accelerating logic is applied to
+###   sidestep even a fasthash if a file otherwise appears in sync : if a file is in place already
+###   in the tree and its size and mtimes match, powercut will avoid doing any kind of checksumming
+###   -- this matches the behavior of the system command rsync(1).  Note: If the mtimes do happen to
+###   mismatch, but the sizes are the same, powercut will insist on doing a full (all bytes)
+###   checksum so as to match the behavior of rsync, regardless of your choice of --fast. However,
+###   even in this "worst case" mtime mismatch where a full hash is requested, a fasthash will be
+###   used first in an attempt to quickly rule out need for a full hash.  Powercut will not
+###   interfere with the correctness of a subsequent rsync(1) tool invcation, so it is pretty safe
+###   to use fast mode and then an actual /usr/bin/rsync to double check the copy.
+###
+### The process makes two passes
+###   Pass 1: "Source Traverse" - move invalid peers out of the way, make winkins, perform copies
+###   Pass 2: "Dest tranverse" - move anything that isn't in the source tree out into backup directory
+
+# bugs: 
+# pass 2 not implemented
+# zero length files seem to trigger rsync doing a full copy
+
+
+##############
+###
+### For the purposes of the code comments and var names I am using the following terminology
+###
+### rsync source1 source2 target1
+###
+### sourceDIR = a directory we are copying FROM
+### target = the top-level directory we are copying TO
+### destinationDIR = the matching directory in the target for a given source - usually target/sourceDIR
+### invalid peer = a destination file peer that does not match the source file in size, modtime and contents. 
+###         Note that this is different than an orphan in that the path is correct, just not contents.
+### orphan = a file underneath the destinationDIR that is no longer supposed to be there - the path
+###          is not present in the sourceDIR so the file on the dest size should either be deleted or moved
+### spare = other files sitting around at the target directory that are not source directories
+### auxiliary = a tree that if the file is present in this tree means we don't need to copy it and can ignore (not implemented yet)
+### included-snapshots = a snapshot - if the listed file is listed here, we can ignore it (not implemented yet)
+
+elsif( $op eq "rsync" )
+{
+    my $targetDIR = pop @filearg;
+
+    $targetDIR =~ s/\/+$//;
+
+    my $targetFse = new FileSetExplorer::RealFiles();
+    $targetFse->setPaths( $targetDIR );
+    $targetFse->loadSizeCache();
+
+# Not currently needed
+#    my $sourceFse = new FileSetExplorer::RealFiles();
+#    $sourceFse->setPaths( @filearg );
+#    $sourceFse->loadSizeCache();
+
+    my $spareFse = new FileSetExplorer::RealFiles();
+    $spareFse->setPaths( @SPARES );
+    $spareFse->loadSizeCache();
+    
+    
+    my $summaryReport = "zz_rsynclog-$$.txt";
+    
+    my $date = `date +%Y%m%d-%H%M%S`;
+    chomp $date;
+
+    my $filecount = 0;
+    my $onsnapshot = 0;
+    my $winkinCount = 0;
+    my $sourceToTargetCopyCount = 0;
+    my $ondrive = 0;
+    my $backneedcount = 0;
+
+    # hash of any duplicates in the dest tree we've already moved so 
+    # we don't hit them up twice!
+
+    my %destDuplicatesClaimed; 
+
+    reportmain "rsync - @filearg\n";
+    
+    foreach my $sourceDIR (@filearg)
+    {
+	reportmain "rsync - $sourceDIR\n";
+
+	my $fi = new FileIterator( $sourceDIR );
+	
+	# We need to compute the destinationTopDir - the parent that will be the head of 
+	# the matching tree in our target directory for this source	
+	
+	
+	my $sourceParent = $sourceDIR;
+	$sourceParent =~ s/\/+$//; # axe trailing slash
+	$sourceParent =~ /([^\/]+)$/; # takebasename
+	my $destinationTopDir = $1; # could be improved in case of multiple sourceDIRs specified where there is a common name
+	
+	
+	my $sourceDirAFN = File::Spec->rel2abs( $sourceDIR);
+	my $sourceOffset = length $sourceDirAFN;
+	
+	my $targetDirAFN = File::Spec->rel2abs( $targetDIR);
+	my $targetOffset = length $targetDirAFN;
+	
+	# Begin iterating over all source files first - our job here will either be to 
+	# winkin or copy a file to match the source
+	
+	while( my $srcFN = $fi->getNext() )
+    	{
+	    my $sourceStatus;
+	    my $sourceHandled = 0;
+	    
+	    ## Compute source and destination paths
+	    
+    	    #print "SOURCE: $srcFN ($sourceOffset)\n";	
+	    next unless -f $srcFN;	
+	    $filecount++;
+	    my $srcAFN = File::Spec->rel2abs( $srcFN );	
+	    my $srcTailPart = $RELPATHMODE ? ($srcAFN) : (substr $srcAFN, $sourceOffset);
+	    
+	    my $destFN = $RELPATHMODE ? "$targetDIR/$srcAFN" : "$targetDIR/$destinationTopDir/$srcTailPart";
+	    
+	    my $destAFN = File::Spec->rel2abs( $destFN );
+	    
+	    #reportmain "Considering: $srcFN -> $destFN\n";
+	    reportmain "\n";
+	    reportmain "Source Traverse: [$srcAFN] -> [$destAFN]\n";
+	    
+	    my $destFilePresent = -f $destAFN ? 1 : 0; 
+	    
+	    # Two major cases here - the destination peer file already exists, or does not exist
+	    # If it exists - check it is OK
+	    # If it does not exist, look for available winkins
+	    
+	    if( $destFilePresent)
+	    {
+		# this is the case where some file is already sitting at the destination
+		# it could be the source file is already present, or it could be an older version
+		# we don't know. 
+		
+		reportmain "   A file aready exists at destination, checking if its a match\n";
+		
+		# should we use getSize instead? hmm...
+		my ($dev,$ino,$mode,$nlink,$uid,$gid,$rdev,$size,
+		    $atime,$mtime,$ctime,$blksize,$blocks)
+		    = stat($srcAFN);
+		
+                my ($ddev,$dino,$dmode,$dnlink,$duid,$dgid,$drdev,$dsize,
+		    $adtime,$dmtime,$dctime,$dblksize,$dblocks)
+		    = stat($destAFN);      
+                
+                my $existingFileMustGo = 0;
+                
+                # if we are not in fast mode, we are compelled to do the full shebang
+                
+                if( $FASTMODE )
+		{        
+		    # First, try to rule out on size
+		    
+		    if( $size != $dsize )
+		    {
+                	reportmain "   Sizes differ, must be relocated\n";
+                	$existingFileMustGo = 1;
+		    }
+		    else
+		    {
+                	# Sizes are a match. If mtimes are also the same we are clear as long as
+                	# fast mode is also on.
+                	
+                	reportmain "   Sizes match, performing more advanced check\n";
+                	
+                	my $modTimesDiffer = ( $mtime != $dmtime );
+                	
+			if( $modTimesDiffer )
+			{
+			    reportmain "   Mod-times differ, checksumming this file\n";
+
+			    my $isIdentical = testIdentical( $srcAFN, $destAFN );
+			    
+			    if( $isIdentical )
+			    {
+				reportmain "   Good news - modtimes differ but file checksums are the same\n";
+				$existingFileMustGo = 0;
+			    }
+			    else
+			    {
+				reportmain "   Bad news - modtimes differ and checksums differ\n";
+				$existingFileMustGo = 1;
+			    }
+			    
+			}
+			else
+			{
+			    $existingFileMustGo = 0;
+			    reportmain "   Mod-times (and sizes) are the same, existing destination file is OK\n";
+			}			
+		    }
+		}
+		else
+                {
+		    reportmain "   Performing full checksum test (--fast not in use!)\n";
+		    my $res = testIdentical( $srcAFN, $destAFN );
+		    reportmain "   Test identical? = $res\n";
+		    $existingFileMustGo =  $res ? 0 : 1;
+                }
+		
+          	if( $existingFileMustGo )
+          	{		    
+		    # Now handle invalid peer processing. Note: there is a small possibility that
+		    # this file is actually an orphan that could be relocated. Therefore, a better
+		    # way to react would be if we actually put it into the pool of orphans to be
+		    # tested later.
+		    
+		    # mark this file as no longer valid to avoid cache coherency issues later
+		    invalidateAfn($destAFN);
+		    $destDuplicatesClaimed{$destAFN} = 1;
+		    
+		    # calculate new path
+		    
+		    my $pathForInvalidPeerFile = $targetDIR . "/backup-$date/$destinationTopDir/$srcTailPart"; 
+		    
+		    # check for colission
+		    
+		    if( -e $pathForInvalidPeerFile )
+		    {
+			$pathForInvalidPeerFile = "$pathForInvalidPeerFile-$filecount-$$";
+			die "could not avoid collision - wierd!!" if( -e $pathForInvalidPeerFile );
+
+		    }
+		    
+		    reportmain "   Status=INVALID - Relocating invalid peer file to: $pathForInvalidPeerFile\n";
+		    report $summaryReport, "MOVE: $destFN -> $pathForInvalidPeerFile\n";
+
+		    if( $execute )
+		    {
+                	
+			&main::mkdirs( $pathForInvalidPeerFile );
+			rename(  $destAFN, $pathForInvalidPeerFile ) or die "failed rename of invalid dest file";
+		    }
+		    else
+		    {
+			
+			reportmain "   Execute OFF - would have MV($destFN, $pathForInvalidPeerFile)\n";
+		    }
+		    
+		}
+		else
+		{
+		    reportmain "   Status=OK - Existing file is acceptable match\n";
+		    $sourceHandled = 1;			    
+		    $ondrive++;
+		}
+		
+	    }
+	    else
+	    {
+		# The destination file is not present. That narrows our potential cases to
+		# WINKIN - e.g. we find some other file 
+		# TRANSFER NEEDED
+		
+		# We now scan for winkins with getDuplicates, but we have to exclude the following
+		# from potential winkin candidates:
+		# 1) those we've already winked in previously
+		# 2) those that do appear to match some other part of the source tree - e.g have a "peer"
+		
+		reportmain "   No file exists at destination, checking for winkins\n";
+
+		# Check for hash duplicates in the destination
+		
+		my @afns = $targetFse->getDuplicates( $srcFN );
+		push @afns, $spareFse->getDuplicates( $srcFN );
+		
+		my $count = scalar @afns;
+		reportmain "   Total of $count duplicates found in dest tree\n" ;
+		my $c = 1;
+		
+		# Now, iterate over hash duplicates to find any that are orphans and could be
+		# winked in. Each hash duplicate is considered a "candidate"
+		
+		foreach (@afns)
+		{
+		    my $candidate = $_;
+		    reportmain "   ($c) Duplicate candidate already at destination> $candidate\n" ;
+		    $c++;
+		    
+		    my $candidateAFN = File::Spec->rel2abs( $candidate );	
+
+		    # Verify that this duplicate candidate is not already used
+		    # In general, we have to be careful about making changes to the filesystem in powercut -- getDuplicates relies on a cache that
+		    # would get out date -- therefore we have to track things we've moved to know to ignore them later
+
+		    if( $destDuplicatesClaimed{$candidateAFN} == 1 )
+		    {			
+			reportmain "      -- Sorry, already claimed earlier for winkin\n";
+			next;	
+		    }
+
+		    ####
+		    # Next, lets see if the candidate hash duplicate in the target directory can
+		    # be used for a winkin. We must distinguish three cases:
+		    # A) The candidate has a PEER in the source directory - e.g., it is correctly
+		    #    placed already for some other source file, just not the one we are
+		    #    processing right now, this is a useful source for a dest-to-dest copy
+		    # B) The candidate in an ORPHAN, e.g. it has a valid peer in the source directory
+		    #    does not exist. This is a valid and preferred wink-in.
+		    # C) The candidate is a "spare" -- e.g. a file at the target that is not covered
+		    #    by the span of our copy, this has secondary preference to an ORPHAN
+		    #    This is equivilent to saying that there is no defined PEER for the file.
+		    ####
+		    
+		    ## note: we currently don't prioritize, we just take the first good match we find for a winkin
+		    
+		    # First, We need to pair out the (C) "spare" case where there is no defined peer. 
+		    # So we need to decide if candidate falls underneath the destination subtree.
+		    # stored in the variable $destinationTopDir
+		    
+		    my $destinationTopDirAFN = $targetDirAFN ."/" . $destinationTopDir;
+		    reportmain "       Checking if candidate falls under subtree $destinationTopDirAFN\n";
+		    
+		    my $prefix = substr $candidateAFN, 0, length $destinationTopDirAFN;
+		    
+		    my $isSpare = ($prefix eq $destinationTopDirAFN) ? 0 : 1;
+		    my $presentInSource = 0;
+		    
+		    reportmain "       Prefix: [$prefix] vs. [$destinationTopDirAFN]\n";
+
+		    if( $isSpare )
+		    {
+			reportmain "       Candidate falls outside of target's destination directory, valid winkin\n";
+			$presentInSource = 0;
+		    }
+		    else
+		    {
+			# Here, we are not a spare. So distinguish between A and B..
+			
+			reportmain "       Candidate falls INSIDE of target's destination directory, testing if it has peer\n";
+			
+			my $candidateTail = substr $candidateAFN,($targetOffset + (length $destinationTopDir) + 1);
+			my $sourceProxy = $sourceDirAFN . "/" . $candidateTail;
+			
+			reportmain "       This candidate if it were in source> $sourceProxy\n";
+			
+			## HARMLESS BUT IMPORTANT BUG - what if the file was found OUTSIDE the tree we are writing into: e.g. DEST/a.txt in the case of DEST/SOURCE/a.txt?
+			# in this case, this is a permisable winkin candidate that we ignore. we should be checking
+			# if candidateTail even falls under the true target directory
+			
+			$presentInSource = -f $sourceProxy ? 1: 0;
+	    	    	
+	    	        # there is a flaw in this logic, because we only check the source directory
+			# we are working on.  theoretically, this file could be needed for another
+			# source directory that is upcoming but the chances of that are probably
+			# pretty rare. Rsync probably has the same design challenge in its
+			# implementation, so might be good to check how it resolves if two inbound
+			# directories overlap in some way on the destination side
+			
+			reportmain "       Peer exists in source flag: $presentInSource (false = valid winkin), spare=$isSpare\n";
+		    }
+		    
+		    # At this point, we now know if we have the A,B or
+		    # C case above. In B or C cases, this candidate could be a "wink
+		    # in."
+
+		    if( ($presentInSource == 0) or ($isSpare == 1))
+		    {
+	    		# reportmain "       HERE: $presentInSource, $isSpare\n";						
+			
+			if( $sourceHandled == 0 )
+			{
+			    reportmain "       WINKIN FOUND! MV($candidate,$destAFN)\n";
+
+			    # Claim this candidate since we are moving it and want to sheild the
+			    # loop for future uses of this file which will no longer be in the
+			    # location that getDuplicates() says it will be in
+
+			    $destDuplicatesClaimed{$candidate} = 1;    
+			    $winkinCount++;
+			    
+			    die "assert failed: candidate = destAFN - internal logic got screwed up somehow" if $candidate eq $destAFN;
+			    report $summaryReport, "MOVE: $candidate -> $destFN\n";
+
+
+
+			    invalidateAfn($destAFN);
+
+			    if( $execute )
+			    {
+				&main::mkdirs( $destAFN );
+				rename( $candidate, $destAFN ) or die "failed rename";
+			    }	
+			    
+			    $sourceHandled = 1;
+			}
+			else
+			{
+			    reportmain "       Another valid winkin, but not needed - ($candidate,$destAFN)\n";
+			}
+		    }
+		}
+	    } # if-file-exists-already clause
+
+	    # At this point, all winkins possible for this source file
+	    # have now been executed.  If the source still has not
+	    # been handled, its time to actually make a copy
+	    
+	    if( $sourceHandled == 1 )
+	    {
+		reportmain "   Final status: Either destination is already good, or winkin made (sourceHandled=$sourceHandled)\n" ;
+	    }	
+	    elsif( $nocopy_mode )
+	    {
+		reportmain "   Final status: Copy needed but skipped due to --nocopy (sourceHandled=$sourceHandled)\n" ;
+	    }
+	    else
+	    {
+		reportmain "   Final status: Copy must be made (sourceHandled=$sourceHandled)\n" ;
+		reportmain "   COPY: $srcAFN -> $destAFN\n";
+		my $START = [gettimeofday];
+
+		my $destDir = dirname $destAFN;
+		my @args;
+		
+		if( 1)
+		{
+		    @args = ('/bin/cp', '-av', $srcAFN, $destDir );
+		}
+		else
+		{
+		    @args = ('/usr/bin/rsync', '-av', $srcAFN, $destAFN );
+		}
+		
+		invalidateAfn($destAFN);
+
+		if( $execute )
+		{				
+		    die "assert failed - tried to copy to a location that already has a file" if -e $destAFN;
+		    
+		    &main::mkdirs( $destAFN );
+		    reportmain( "   SYSTEM: [" . (join '],[', @args ) .  "]\n");
+
+		    system( @args ) ==0 or die "failed copy: $? $0 $!";
+
+		    my $END = tv_interval( $START );
+
+		    reportmain "   COPY COMPLETE: $END seconds\n";
+		}		
+		else
+		{
+		    reportmain ("   Execute mode OFF - FAKE ONLY\n");
+		    reportmain( "   Would have done this: [" . (join '],[', @args ) .  "]\n");
+		}
+
+		$sourceToTargetCopyCount++;			
+		report $summaryReport, "COPY: $srcFN -> $destFN\n";
+	    }
+	} # source dir iterator
+	
+	
+	# Now move onto pass 2, where we clean out the destination directory of anything not in the
+	# source. Files are moved into the working backuo directory
+	
+	my $fi = new FileIterator( "$targetDIR/$destinationTopDir" );
+	while( my $destFN = $fi->getNext() )
+	{
+	    next if not -f $destFN;
+	    
+	    my $destAFN = File::Spec->rel2abs( $destFN );	
+	    
+	    my $destTail = substr $destAFN, ($targetOffset + (length $destinationTopDir) + 1);
+	    my $sourceProxy = $sourceDirAFN . "/" . $destTail;
+	    
+	    reportmain "\n";
+	    reportmain "Dest Traverse: pre - destTopDir:$destinationTopDir sourceDIR:$sourceDIR\n";
+	    
+	    reportmain "Dest Traverse: [$sourceProxy] -> [$destFN]\n";
+	    
+	    if( -e $sourceProxy )
+	    {
+		reportmain "   Source file does exist, no action needed\n";
+	    }
+	    else
+	    {
+		reportmain "   Source file does NOT exist, destination file must be removed\n";
+		
+		my $pathForInvalidPeerFile = $targetDIR . "/backup-$date/$destinationTopDir/$destTail"; 
+		
+		# check for colission
+		
+		if( -e $pathForInvalidPeerFile )
+		{
+		    $pathForInvalidPeerFile = "$pathForInvalidPeerFile-$filecount-$$";
+		    die "could not avoid collision - wierd!!" if( -e $pathForInvalidPeerFile );
+		}
+		
+		reportmain "   Relocating destination orphan to: $pathForInvalidPeerFile\n";
+		
+		report $summaryReport, "MOVE: $destFN -> $pathForInvalidPeerFile\n";
+		
+		if( $execute )
+		{
+		    reportmain "   Execute ON - MV($destFN, $pathForInvalidPeerFile)\n";
+		    
+		    &main::mkdirs( $pathForInvalidPeerFile );
+		    rename(  $destAFN, $pathForInvalidPeerFile ) or die "failed rename of invalid dest file:$!";
+		}
+		else
+		{
+		    reportmain "   Execute OFF - would have MV($destFN, $pathForInvalidPeerFile)\n";
+		}
+	    }	    
+	}
+    }#iterator of all sources	
+
+## Foreach $sourcedir
+## start a find
+## for each file, calculate srcFN and destFN 
+## if dest file already exists with -e, then skip
+## if dest file does not exist, see if a hash duplicate exists in dest tree
+##   for each potential hash duplicate, check if that hash duplicate is in the source tree
+##   for the first that is NOT in the source tree, move it into dest location
+##   optimization: look for other files at the same directory that ought to move in instead
+
+sub test{print"hi"; }
+
+
+
+
+
+reportmain "**************\n";
+my @fileargQM = map { s/\ /\\\ /; $_; } @filearg;
+my $targetDIRQM =   $targetDIR ;
+$targetDIRQM  =~ s/\ /\\\ /;
+
+reportmain "To verify, run the following command: rsync -av -ni @fileargQM $targetDIRQM\n";
+reportmain "Look at the first column, should be all periods showing no action needed\n";
+reportmain "************\n";
+
+
+reportmain "Total files in source set: $filecount\n";
+reportmain "Total full byte xfers from source-drive to dest-drive $sourceToTargetCopyCount\n";
+
+reportmain "Total winkins made: $winkinCount\n";
+reportmain "Files already at destinations: $ondrive\n";
+reportmain "Files found in listed snapshots: $onsnapshot\n";
+reportmain "Files needing backups: $backneedcount\n";
+
+}
+
+
+
+
+
+elsif( $op eq "lsdup-across" )
+{
+    my $aux = new FileSetExplorer::RealFiles();
+    $aux->setPaths( @AUXPATH );
+    $aux->loadSizeCache();
+
+    my $snaps = new FileSetExplorer::Snapshots();
+    $snaps->setPaths( @SNAPSHOTS );
+    $snaps->loadSizeCache();
+
+    my $date = `date +%Y%m%d-%H%M%S`;
+    chomp $date;
+
+    my %agentForDev;
+
+    my $fi = new FileIterator( @filearg );
+    
+    debug( "Starting run checking for dups" );
+
+    while( my $fn = $fi->getNext() )
+    {
+	next unless -f $fn;
+
+	reportmain "----- $fn\n";
+
+	my @auxFns = $aux->getDuplicates( $fn );
+	if( @auxFns > 0 )
+	{
+	    # print "Auxiliary copy found, Full list here:\n";
+	    map {reportmain "   atAuxAlready > $_\n" } @auxFns;
+	    reportmain "   DUPLICATE";
+	    
+	    report( "PC-duplicate-report-$$.txt", "DUP=YES $fn\n" );
+
+	    report( "PC-has-duplicates-$$.txt", "$fn\n" );
+	    report( "PC-has-duplicates-$$.zeroterm", "$fn\0" );	   
+	    next;
+	}
+
+	my @snapsFns = $snaps->getDuplicates( $fn );
+	if( @snapsFns > 0 )
+	{
+	    # print "Listed snapshot found. Full list here:\n";
+	    map {reportmain "   atSnapAlready > $_\n" } @snapsFns;
+	    reportmain "   DUPLICATE";
+	    report( "PC-has-duplicates-$$.txt", "$fn\n" );
+	    report( "PC-duplicate-report-$$.txt", "DUP=YES $fn\n" );
+	    next;
+	}
+
+
+	    report( "PC-duplicate-report-$$.txt", "DUP=NO  $fn\n" );
+
+	report( "PC-not-duplicated-$$.txt", "$fn\n" );
+	
+	
+
+    }
+}
+
+
+
+
+
+
+
+
+
+##
+## lsdup -- lists all duplicate files in the selected set
+## judges the "primary" version of the file to be the most recently modified
+## everything else is listed as the duplicate.
+## 
+## Note: This code is working, but does not use FSE synta
+
+
+# my $nfs = new FileSet::FSFromPathnames(); 
+#     $nextfn = $nfs->getNext();
+# my $fse = new FileSetExplorer( $nfs );
+# while( $f = $fse->getNext() )
+#    print explrong file $f
+#    @dups = $fse->getDuplicates($f)
+#     print them
+#
+#   getDuplicates( f) does this:
+#      h = $fse->geHash( f )  # always use the fSE gethash, which knows its FSE's verification rules  
+#      fse->filesWithHashInSet(f);   -- will call "getHash" on those files to be sure records up to date
+#      de
+
+
+
+
+
+#
+# lsdup will go through conservativly looking just for duplicates.
+# Files are only scanned if it appears there is a likely duplicate
+# At the end of the scan, a full dump is made to the user
+# a minimal number of stats and hashes are made, using the database as a cache
+# for maximum confidence, reset the database or force a full-rescan before running this
+#
+
+elsif( $op eq "lsdup" )
+{
+    my @flist;
+    my %sizes;
+    
+
+    my $fi = new FileIterator( @filearg );
+    while( my $fn = $fi->getNext() )
+    {
+	my $afn = $fn;
+	next unless -f $afn;
+	
+#	push @flist, $afn;
+	
+	my $size = getSize( $afn );
+
+	next if $size == 0 && $includezerolen == 0;
+
+	push @{$sizes{$size}}, $afn;
+    }
+
+    reportmain "\n\nScan Done\n";
+
+    foreach my $size (reverse sort {$a <=> $b } keys %sizes)
+    {
+	if( @{$sizes{$size}} > 1 )
+	{
+	    my %fwh;
+
+	    reportmain "--$size\n";
+
+	    foreach my $fn (@{$sizes{$size}})
+	    {
+		my $hash = getChecksum($fn); 
+		push @{$fwh{$hash}}, $fn; 
+	    }
+	    
+	    foreach my $hash ( keys %fwh )
+	    {
+		
+
+
+		if( @{$fwh{$hash}} > 1 )
+		{
+		    reportmain "The following files are hash duplicates:\n";
+		    reportmain "\n";
+
+		    my $first = 0 ;
+		    
+		    foreach (@{$fwh{$hash}})
+		    {
+			reportmain "   $_\n";
+
+			report( "zz__$$-all_dup.txt", "$_\n");
+
+			if( $first > 0 )
+			{
+			    report( "zz__$$-randomly_chosen_dup.txt", "$_\n");
+			    report( "zz__$$-randomly_chosen_dup.zero","$_\0");
+			}
+
+			$first ++;
+
+		    }
+		    reportmain "\n";
+
+		    my $c = @{$fwh{$hash}} - 1;
+		    my $wasted = $c * $size;
+		    
+		    $count_dupbytes += $wasted ;
+		    $count_dupfiles += $c;
+
+		    reportmain sprintf( "   Wasted Space=%d bytes (%d x %d)      Cum:[%dK in %d]\n", $wasted, $c, $size, $count_dupbytes/1000, $count_dupfiles ); 
+		  }
+	      }
+#	    printh "Here\n";
+	  }
+	
+      }
+    reportmain "LSDUP Done\n";
+}
+
+
+
+
+
+
+
+
+
+
+## addvol <name> <path>
+##  creates a volume of the given name
+## 
+## add a pathtag to the 
+
+## lsvol - lists available volumes
+
+
+## replicate target <files>
+
+## for each file, ensures there is at least 1 other copy on a different pathtag
+## if not, the normal backup approach is used to put one there
+
+## load target as $targetfse
+## for each file in main FSE
+##
+##    MDB->getPathtags( $f );
+##   if( count of pathtags < 2 ) and ( targetfse doesn't already have it)
+##      makebackup
+
+
+
+
+
+
+
+
+# hasHashInSet
+# calls fileWithHashInSet -- true if > 0 results
+
+# filesWithHashInSet
+# returns files that havethe given hash is available in the FSE. It can be anywhere in the set
+# for the function to return true. Normal verification rules are in place -- the cache
+# is trusted.
+#
+# to determine this, the hash is tested against the master database, and list of matches returned
+# a filter is applied, only returning those matches "underneath" the listed files
+#       In the case of real directorys, path prefixes are used -- this could miss 
+#              files added to target since the last scan
+#       In the case of snapshots, the snapshot must be enumerated 
+# next, each match is verified
+# return this listE
+
+# another approach?
+# enumerate the entire set, storing a local hash table mapping CheckSum->Files
+#    this will be fast to generate, since master DB can help
+# if you don't enumerate, you could miss things added to the database
+
+
+
+
+# Data we keep
+
+# FILE -> HASH (and validation info)
+# HASH -> List of File Names
+# HASH -> List of PathTags
+# PATHTAG -> VolumeName
+
+
+
+
+elsif( $op eq "skipcheck" )
+{
+
+    my @counters;
+    my $fi = new FileIterator( @filearg );
+    while( my $fn = $fi->getNext() )
+    {
+	next if not -f $fn;
+	
+	next unless $fn =~ /\.JPG|\.CRW|.CR2/;
+
+	$fn =~ /\/([^\/]+)$/;
+	my $basename = $1;
+
+	$basename =~ /^(....)(....)\..+$/;
+	
+	my $prefix = $1;
+	my $counter = $2;
+
+	print "Checking [$fn] $basename ($counter)\n";
+
+	push @counters, [$basename, $prefix , $counter];
+       
+    }
+
+    @counters = (sort {$a->[0] cmp $b->[0]}  @counters); 
+
+    my $t;
+    my $firstgood;
+    my $lastgood;
+
+    for( my $i = 0 ; $i < @counters ; $i++ )
+    {
+
+	my $prefix = $counters[$i]->[1];
+	my $count = $counters[$i]->[2];
+
+
+	if (not defined $t)
+	{
+	    $t = $count;
+	    print "Resetting $t to $count\n";
+		
+	}
+
+
+	my $v = $prefix . $count; 
+	
+	my $status;
+	$status = $prefix.$t eq $v ? "GOOD" : "BAD";
+
+	if( $prefix.$t eq $v )
+	{
+	    if( not defined $firstgood)
+	    {
+		$firstgood = $v;
+	    }
+
+
+	}
+	else
+	{
+	    print "LASTGOOD\n";
+
+	    $lastgood = $v;
+
+	    print "Good Series: $firstgood -> $lastgood\n";
+	    
+	    $t = undef;
+	    $lastgood = undef;
+	    $firstgood = undef;
+	    
+	}
+
+
+	print "Found: [$v] Golden Clock: [$t] -- $status\n"; 
+
+	$t++ if defined $t;;
+
+	
+
+
+    }
+
+}
+
+
+elsif( $op eq "query" )
+{
+my $fi = new FileIterator( @filearg );
+    while( my $fn = $fi->getNext() )
+    {
+	debug "Query [$fn]";
+	my $afn = File::Spec->rel2abs( $fn ) ;	
+	debug "    -> Abs name=[$afn]";
+	next unless -f $afn;
+	my $hash = getHash( $afn );
+
+	die "hashToAfnDB is not implemented";
+	my @otherFiles = $hashToAfnDB->get_dup( $hash );
+
+	foreach my $f ( @otherFiles )
+	{
+	    print "  ALSO: $f\n";
+	}
+    }
+}
+elsif( $op eq "add-num" )
+{
+
+    my $fi = new FileIterator( @filearg );
+    while( my $fn = $fi->getNext() )
+    {	
+	my $bn = basename $fn;
+	my $dn = dirname $fn;
+	my $newname = $bn;
+	
+	$newname =~ s/[^A-Za-z0123456789\.\(\)\_]/\_/g;
+	$newname =~ s/\_+/\_/g;
+	
+	my $new = $dn . "/" . $newname;
+	
+	debug "Dealing with [$fn]";
+	queue_rename( $fn, $new );
+    }		
+}
+
+elsif( $op eq "dbstat" )
+{
+    &do_dbstat();
+}
+
+elsif( $op eq "timertest" )
+{
+    &do_timertest();
+}
+
+
+
+###
+# The assure operation is the key to the managed backup functionality
+# of the program. It spits out the current known # of bytes backed up
+# and bytes needing backup. A full recursive decent is made to update
+# stats, files, and backup data, but the decent will trust previous
+# computations made within a certain time window.
+###
+
+
+elsif( $op eq "assure" )
+{
+    my $d = shift @filearg;
+
+    my $afn = File::Spec->rel2abs( $d ) ;	
+
+    my $fw = FileWalker->create();
+    $fw->debugmode(1);
+    $fw->debugname( "M" );
+    my $dirent = $fw->assure( $afn, 800000,300000,-1,-1,undef,-1,3600*24*0 );
+
+    my $oFileCount = $dirent->count();
+    my $oSize = $dirent->size();
+
+    print "------> ASURE OUTPUT---- Files: $oFileCount Size: $oSize\n";
+
+
+
+
+}
+
+
+else
+{
+    print "bad operation:$op\nTry: pc help\n";
+}
+
+
+doshutdown();
+
+
+
+
+
+
+exit(0);
+
+### Note: This function was tweaked over the course of about 6 hours
+### of reading and checking and is pretty stable. Be careful about edits!
+### My assumption is that 40 is the threshold for off-site backups
+
+sub prioritizeFN
+{
+    # 100 - most critical
+    # 90 - things like bests, criticals
+    # 70-79  - stuff marked as PTP, good, etc
+    # 60-69  - things in my dropbox folder, zip files, email, PhotoFSX, mp3, music, keep, 2plus
+
+    # cutoff for geographic redundancy
+
+    # 50-59  - general purpose, things not otherwise marked, dmg, 1stars
+    # 40-49  - low priority - VMs, photos marked for archival, stuff marked private, videos
+
+    # cutoff for general purpose backups
+
+    # 30-39  - photo rejects, userdir library stuff
+    # 20-29  - generally useless - applications, stuff marked "no backup", lrpreview 
+    # 10-19  - very very low priority crap (mobile backups, dotfiles, trashes, caches) 
+    # 00-09  - actively exclude -- either very wasteful or dangerous to back up - caches, system files
+
+    my $fn = shift;
+    my $s = undef;
+
+    chomp $fn;
+    chomp $fn;
+
+    $_ = $fn;
+my    $basename = basename($fn);
+
+    study $_;
+
+    return 0 if( $fn =~ /\.pcip_info$/ );
+    return 0 if( $fn =~ /^\/.dbfseventsd/ );
+    return 0 if( $fn =~ /^\/.Trashes/ );
+    return 0 if( $fn =~ /^\/.vol/ );
+    return 0 if( $fn =~ /\.Spotlight-V100/ );
+    return 0 if( $fn =~ /^\/.MobileBackups/ );
+    return 0 if( $fn =~ /\TheVolumeSettingsFolder/ );
+
+    return 1 if( $fn =~ /.DS_Store$/ );
+    return 1 if( $fn =~ /.localized$/ );
+    return 1 if( $fn =~ /Adobe\/AdobePatchFiles/ );
+
+    return 1 if( $fn =~ /\/System/ );
+    return 1 if( $fn =~ /\/usr/ );
+    return 1 if( $fn =~ /\/private/ );
+    return 1 if( $fn =~ /\/var/ );
+    return 1 if( $fn =~ /\/etc/ );
+
+    return 4 if( $fn =~ /\.dropbox\.cache/ );
+
+    return 10 if( $fn =~ /^\\./ );
+    return 26 if( $fn =~ /\.sparsebundle/ );
+    return 11 if( $fn =~ /^\/Applications/ );
+
+
+    return 20 if( $fn =~ /\.app\// );
+    return 21 if( $fn =~ /\.lrprev$/ );
+    return 21 if( $fn =~ /\.lrmprev$/ );
+
+    if( /\.backupdb\// )
+    {
+	return 2 if /\/(Library|System|usr|private|var|etc)\//;
+    }
+
+    ### Assume anything below this line is not automatically excluded
+
+    return 25 if /\/\.Trash\//;
+
+    return 90 if /CRIT|CRITICAL/;
+    return 66 if /\.(m4a|mp3|m4r|flac|m4p)$/;
+    return 67 if $basename =~ /iTunes Music Library.xml|iTunes Library/;
+
+    return 38 if (/\.aplibrary/);
+
+    ## handling photos and photo like things
+    
+    if( /\.(cr2|crw|raw|thm|jpg|tif|tiff|xmp|psd|psb|png|jpeg)$/i )
+    {
+	return 32 if /THM$/i;
+	return 74 if /3star/;
+	return 74 if /PTP/;
+	return 64 if /2star/;
+	return 65 if /2plus/;
+	return 56 if /1star/;
+	return 56 if /R1F/;
+	return 56 if /1\-star/;
+	return 55 if /1plus/;
+	return 56 if /onestar/;
+	
+	return 28 if /No Backup|NoBackup|NoBak|OKTD/i;
+
+	return 54 if /keep/;
+	return 34 if /reject/i;
+	return 34 if /reject/i;
+	return 34 if /\/archive/i;
+	return 34 if /rej/i;
+	return 33 if /Deleted/i and not /\/deleted\-\d\d\d/;
+	return 31 if /DelME/i;
+	return 44 if /reviewed/i;
+	return 34 if /spare/i;
+	return 34 if /lens test/i;
+
+	# give up go to source
+	return 61 if /good/i and not /private/i;
+	return 65 if /best/i and not /private/i;
+	return 58 if /HTML/i;
+	return 59 if /LRM/ and not /Not LRM/i;
+	return 48 if /SPARES/;
+	return 40 if /temp|tmp/i;
+	return 43 if /APG/i;
+
+	return 41 if /Private|Privates|PRIVATE/i;    
+
+	return 53;
+    }
+
+    return 35 if( /iTivo/ );
+    return 44 if( /TaliaMedia/ );
+
+
+
+
+
+    if( /VM/ )
+    {
+	return 44 if /.hdd\//;
+    }
+
+    if( /Video Prod|VideoProd/i )
+    {
+	return 37 if /Thumbnail|Stabilization|Analysis Files|Transcoded|Proxy|Cache|Conformed|Preview|Proxies|Render Files/i;
+	return 48;
+    }
+    return 41 if /Private|Privates|PRIVATE/i;    
+    return 49 if /\.(mov|avi|mp4)$/;
+
+
+    # handling things that look like home directories
+
+    if( /\/Users\/\w+\/(.+$)/ )
+    {
+	my $u = $1;
+	return 3 if $u =~ /\.(dropbox|adobe|pcrun|powercut|Trash)/;
+	return 10 if( $u =~ /Album Artwork/i );
+
+	return 22 if( $u =~ /^Applications/ );
+
+	return 22 if /No Backup|NoBackup|NoBak|OKTD/;
+
+	if( $u =~ /^Library/ )
+	{
+	    return 52 if /Evernote/i;
+	    return 45 if /Mail/i;
+	    return 14 if /MobileSync/i;
+	    return 14 if /Caches/i;
+	    return 14 if /PubSub/i;
+	    
+
+	    return 33;
+	}
+
+	return 60 if( $u =~ /^Dropbox/ );
+	return 60 if( $u =~ /^1Password/ );
+	return 60 if( $u =~ /\.abcdp$/ );
+
+	return 70 if( $u =~ /1Password.agilekeychain/ );
+
+	return 40 if( $u =~ /^(private|jgpriv|priv|sex|latex)/i );
+
+	return 62 if( /.emlx$/ );
+	return 62 if( /.pst$/ );
+
+	return 51;
+
+    }
+
+    return 19 if /No Backup|NoBackup|NoBak|OKTD|No backups/i;
+    return 47 if /Mirror/i;
+
+    return 50; 
+}
+
+
+sub handleMakeSnapshot
+{
+
+    my @filearg = @_;
+    my $fi = new FileIterator( @filearg );
+
+    my $str = POSIX::strftime( "%Y%m%d%H%M%S", gmtime($NOW) );
+
+    my $name = "snapshot";
+    $name = "$VAULT_NAME" if( $VAULT_NAME );
+    
+    my $snapFN = "$name-$str.pc";
+
+    my $START_GTOD_MAIN = [gettimeofday];
+    my $i;
+
+    while( my $fn = $fi->getNext() )
+    {
+	my $START_GTOD = [gettimeofday];
+	$i++;
+	
+	my $afn = File::Spec->rel2abs( $fn ) ;
+	my $t = -f $afn ? "FILE:" : " DIR:";
+
+	next unless -f $afn;
+	$count_targetFilesProcessed++;
+	my $ar = writeAFNtoSnapshot( $afn, $snapFN );
+
+#	print "$dn - $bn\n";
+
+	writeInPlace( $afn, $ar );
+
+	my $tpi = tv_interval( $START_GTOD ) * 1000000;
+	my $tps = 1/(tv_interval( $START_GTOD_MAIN ) / $i);
+	debug sprintf "$t$afn (%.0f usec) (%1.3f per second est)", $tpi, $tps;
+
+    }
+
+}
+
+
+ 
+sub getFreeSpace
+{
+    my $path = shift;
+
+    my $res = `df -k $path`;
+    my @lines = split '\n', $res;
+    shift @lines;
+    my $l = shift @lines;
+    print "line: $l\n";
+    chomp $l;
+    my @e = split /\s+/, $l; 
+    print join '/',@e;
+    print "\n\n";
+
+    return ((($e[1]) * 1024),
+	    (($e[2]) * 1024),
+	    (($e[3]) * 1024));
+    
+}
+
+
+
+### Implemented June 2011
+## 
+## PCIP is the functionality to keep an "in place" snappshot. PCIP = "Powercut Cache In Place"
+## the ideas is that in the situation where the database cannot resolve a file's AFN (hash and other characteristics)
+## then it will look for a dotfile that contains a mini snapshot. This snapshot is the same format as a normal
+## snapshot (in fact, it uses the snapshot assetrecord structure to read and write itself), however all pathnames
+## are forced to be directory local..
+##
+## this has several benefits:
+##
+## - preexisting snapshots can be recovered quickly without the central database
+##
+## - greater resiliance to renaming or moving directories, avoiding the need to recalculate hashes
+##
+## Current limitations
+##
+## - does not write out on discovery, only on snapshot
+##
+## - should write out more information about the other possible sources of a file, such as registered snapshots. this would be great!
+##
+## - not smart about invalidating the dotfiles or overwriting only when data is changed
+##    ideally would intercept appends and check if they are already in the file avoiding need to write already known information
+##    disk i/o is likely to be by far the most expensive part of this new feature
+##
+## - other optimizations: if moddate of an AFN without a database entry is > the pcinfo, don't bother with a load'
+##    
+## - no human readable format
+
+
+
+
+
+# contact here is that writeInPlace should only be called if the entire directory is being traversed. It cannot update
+# the PCIP file onsie-twosie, only in bulk
+
+sub writeInPlace()
+{
+    my $afn = shift;
+    my $ar = shift;
+
+    my $bn = basename $afn;
+
+#    print "$afn\n";
+   
+    my @REC = $ar->asArray();
+
+    shift @REC; # get rid of the AFN for backwards compatability
+    	
+    my $rec = join ":", @REC;
+    
+    my $rawRecord = "$bn\0$rec\0";
+
+    my $inPlaceFN = getPCIPfilenameForAFN( $afn );
+
+    appendInPlaceFile( $inPlaceFN, $rawRecord );
+}
+
+sub getPCIPfilenameForAFN
+{
+    my $afn = shift;
+
+    my $dn = dirname $afn;
+    my $inPlaceFN = $dn . "/.pcip_info";
+
+    return $inPlaceFN;
+}
+
+my $LAST_PCIP_FILE;
+my $ONGOING_PCIP_RECORD;
+my $PCIP_FH; 
+
+sub appendInPlaceFile
+{
+    my $inPlaceFN = shift;
+    my $rawRecord = shift;
+
+    if( $inPlaceFN ne $LAST_PCIP_FILE )
+    {
+	flushPCIP();
+    }
+    
+    $LAST_PCIP_FILE = $inPlaceFN;
+    $ONGOING_PCIP_RECORD .= $rawRecord;
+
+    print "SOFT Writing in place file: $inPlaceFN -- $rawRecord\n";
+}
+
+
+sub flushPCIP
+{
+	if( defined $LAST_PCIP_FILE and (0 < length $ONGOING_PCIP_RECORD ))
+	{
+	    $PCIP_FH = new FileHandle;
+	    open $PCIP_FH, ">$LAST_PCIP_FILE" or warn "Cannot write to $LAST_PCIP_FILE: $!";
+	    print $PCIP_FH $ONGOING_PCIP_RECORD;
+	    close $PCIP_FH or warn "Cannot close PCIP: $!";
+	    $PCIP_FH = undef;
+	    $ONGOING_PCIP_RECORD = undef;
+
+	    print "PCIP FLUSHED: $LAST_PCIP_FILE\n";
+	}
+
+}
+
+
+sub loadPCIPforAFN
+{
+    my $afn = shift;
+    my $pcipFN = getPCIPfilenameForAFN( $afn );
+    loadPCIP( $pcipFN );
+    
+}
+
+my $LASTPCIPREAD;
+
+sub loadPCIP
+{
+    my $pcipFN = shift;
+
+    if($pcipFN eq $LASTPCIPREAD)
+    {
+	return;
+    }
+    
+    $LASTPCIPREAD = $pcipFN;
+
+    return if not -r $pcipFN;
+
+
+
+    my $fh = new FileHandle;
+    my $r = open $fh, "<$pcipFN";
+    if( not $r )
+    {
+	warn "Could not open PCIP file $pcipFN: $!";
+	return;
+    }
+
+    print "----------------\n";
+    print "PCIP FILE: $pcipFN\n";
+    
+    my $dirName = dirname( $pcipFN );
+
+    while( not eof($fh) )
+    {
+	my( $afn, $vec);
+	{
+	my $t = $/;
+	$/ = "\0";
+	$afn = $fh->getline();
+	chomp $afn;
+	$vec = $fh->getline();
+	chomp $vec;
+	$/ = $t;
+	
+	
+	}
+	
+	print "PCIP Read record for $afn\n";
+    
+	my @vec = split ":", $vec;
+	my $ar = new AssetRecord();
+	$ar->autoRefresh( 0 );
+
+
+	my $realAFN = $dirName . '/' . $afn;
+
+	# the standard for PCIP files is to NOT include the AFN in the asset record
+	# shift @vec; # get rid of the embedded afn
+
+	$ar->loadFromArray( $realAFN, @vec );
+	
+	discover_file( @$ar );
+	
+	print "PCIP: READ: $pcipFN for $afn -> $realAFN\n";
+	
+    }
+
+    print "----------------\n";
+
+    close $fh;
+
+    $fh = undef;
+    
+}
+
+
+sub do_dbstat()
+{
+    printstats("File Version", $fileversionBDB);
+    printstats("Size to FV", $sizeToFVBDB);
+    printstats("Hash to FV", $hashToFVBDB);
+    printstats("AFN to AR", $afnToAssetRecordBDB);
+    printstats("Directory", $afnToDirentBDB );
+
+}
+
+sub do_timertest()
+{
+    my $START = [gettimeofday];
+    my $i;
+    for( $i=0 ; $i < 1000 ; $i++ )
+    {
+	my $END = tv_interval( $START );
+	print "$i $END\n";
+    }
+    
+    my $END = tv_interval( $START );
+    print "$i $END\n";
+
+}
+
+
+sub printstats()
+{
+    my $dbname = shift;
+    my $db = shift;
+
+    print "------------------------------------------------------\n";
+    print "Dump of database: $dbname\n";
+
+    my $h = $db->db_stat();
+
+    foreach my $k (sort keys %$h )
+    {
+	print "  $k: $h->{$k}\n";
+    }
+
+}
+
+# getPathTag - returns the "common name" applying to the file in question
+#
+# A pathtag is an alias for part of the path. For instance, MAILFILES could map to
+# /Volumes/External150/Data/Mail.
+#
+# To identify a pathtag, the user places a .pathtag file in the relevant directory.
+# Due to the expense of determining pathtags, the script caches it's discoveries.
+
+sub getPathTag
+{
+    my $fn = shift;
+
+    # First, strip down $fn to the directory
+
+    print "GPT:    fn $fn\n";
+
+    my $basedir = $fn;
+
+    return getPathTagFromDir( $fn );
+}
+
+my %dirToPathTag;
+
+# A recursive function that returns (and caches) the pathdag for the given pathname
+
+sub getPathTagFromDir
+{
+    my $dir = shift;
+
+    print "Checking $dir\n";
+
+    # First, strip off my name so that we are looking at the parent
+
+    $dir =~ s/\/[^\/]*$//;
+
+    # If already in the cache, return it
+
+    if( exists $dirToPathTag{$dir} )
+    {
+	return $dirToPathTag{$dir};
+    }
+
+    my $pathfile = "$dir/.pathtag";
+    my $pt;
+
+    $count_stat++;
+
+    # If pathtag file appears to exist, read the pathtag
+
+    if( -e $pathfile && -r $pathfile )
+    {
+	$pt = readPathTagFromFile( $pathfile );
+    }
+    
+    # If we didn't find the pathtag already, and there is another parent to scan, scan it.
+
+    if( (not defined $pt) )
+    {
+	# If another parent, search it
+	# else, conclude no pathtag
+
+	if( (length $dir > 0 ))
+	{
+	    $pt = getPathTagFromDir( $dir );
+	}
+	else
+	{
+	    $pt = "___NONE___";
+	}
+    }
+
+
+    if( defined $pt )
+    {
+	$dirToPathTag{$dir} = $pt;
+	print "Discovered Pathtag [$pt] for [$dir]\n";
+    }
+
+    return $pt; 
+}
+
+sub readPathTagFromFile
+{
+    my $fn = shift;
+
+    $count_fastreads++;
+
+    print "reading: $fn\n";
+
+    my $fh = new FileHandle;
+
+    open $fh, "<$fn" or return "";
+
+    my $line = <$fh>;
+
+    close $fh;
+
+    chomp $line;
+    
+    return $line;
+}
+
+sub invalidateAfn
+{
+	# removes all existing records pointing to an AFN
+	# does not invalidate global reverse hashes (they are not fully implemented as of jan 2012)
+	# also does not invalidate records inside of fileset explorers
+	
+	my $afn = shift;
+	
+	delete $afnToAssetRecord{$afn};
+	flushPCIP();
+	my $p = getPCIPfilenameForAFN($afn);
+	if (-e $p)
+	{
+		unlink $p or die "failed to remove pcip file $p for $afn on invalidateAfn: $!";
+	}
+	
+	
+	}
+
+
+# discover_file -- update the master database with new information discovered 
+# 
+# This function is called when ever new "truth" is discovered about a file on disk.
+# Any value defined will be taken as true and updated in the master database.
+# Any value not defined is assumed to have unknown status.
+#
+# discover_file handles some "common sense" logic. For instance, if the size reported
+# is found to differe from the master database, the function also invalidates the hash even
+# if the hash has not been recomputed.
+#
+# However, the function does not make any assumptions about how "stale" information is as long
+# as the new information has a more recent date than the old informatiion.
+
+sub discover_file
+{
+    my ( $afn, $size, $hash, $sizedate, $hashdate, $deldate, $fasthash, $fasthashdate, $fasthashdepth  ) = @_;
+
+    print "DISCOVER: $afn\n" if $MDB_DEBUG ;
+    print "DISCOVER: " . join "/", "Size: " . $size, $hash, $sizedate, $hashdate, $deldate, $fasthash, $fasthashdate, $fasthashdepth if $MDB_DEBUG;
+    print "\n" if $MDB_DEBUG;
+
+    return if $noDB;
+
+    my $r;
+
+    $r = $afnToAssetRecord{$afn};
+    $main::count_dbread++;
+
+    my $recordHadExistedBefore = 0 ; 
+
+    if( not defined $r )
+    {
+	$r = +{};
+    }
+    else
+    {
+	$recordHadExistedBefore = 1;
+
+	## Check to make sure that new data is in fact better than old
+	## data.  If the the incoming dates are less recent than
+	## existing dates, take no action. If stale data detected,
+	## eliminate updating anything in the record related to that
+	## figure, since its all likely to be bad.
+
+	my	$origSizedate = $r->{'SIZEDT'};
+	my	$origHashdate = $r->{'HASHDT'};
+	my	$origFastHashdate = $r->{'FASTHASHDT'};
+	
+	# Is new size information in fact newer?
+
+	if( defined $sizedate and
+	    defined $origSizedate and
+	    $sizedate <  $origSizedate )
+	{
+	    reportmain "Discover is being given stale data -- assert failed: size - OLD:$origSizedate NEW:$sizedate\n";
+	    undef $size;
+	    undef $sizedate;
+	}
+
+	# Is new fast checksum information in fact newer? If not, ignore it.
+
+	if( defined $fasthashdate and
+	    defined $origFastHashdate and
+	    $fasthashdate <  $origFastHashdate )
+	{
+	    reportmain "Discover is getting stale data-- assert failed: fasthash - OLD:$origFastHashdate NEW:$fasthashdate\n";
+
+	    undef $size;
+	    undef $sizedate;
+	    undef $fasthash;
+	    undef $fasthashdate;
+	    undef $fasthashdepth;
+	}
+
+	# Is new full checksum information in fact newer?
+	
+	if( defined $hashdate and
+	    defined $origHashdate and
+	    $hashdate <  $origHashdate )
+	{
+	    
+	    reportmain "Discover is getting stale data-- assert failed: hash - OLD:$origHashdate NEW:$hashdate\n";
+	    
+	    undef $size;
+	    undef $sizedate;
+	    undef $fasthash;
+	    undef $fasthashdate;
+	    undef $fasthashdepth;
+	    undef $hash;
+	    undef $hashdate;
+	}	
+    }
+
+    my $oldHash = $r->{'HASH'};
+    my $oldFasthash = $r->{'FASTHASH'};
+    my $oldSize = $r->{'SIZE'};
+
+#    debug "new size: $size, old size $oldSize";
+
+    # Update the database with our new information
+
+    $r->{'FN'} = $afn if defined $afn;
+
+    $r->{'SIZE'} = $size if defined $size;
+    $r->{'HASH'} = $hash if defined $hash;
+    $r->{'SIZEDT'} = $sizedate if defined $sizedate;
+    $r->{'HASHDT'} = $hashdate if defined $hashdate;
+    $r->{'DELDT'}  = $deldate if defined $deldate;
+    $r->{'FASTHASH'} = $fasthash if defined $fasthash;
+    $r->{'FASTHASHDT'} = $fasthashdate if defined $fasthashdate;
+    $r->{'FASTHASHDEPTH'} = $fasthashdepth if defined $fasthashdepth;
+  
+
+#    debug "Size now at: $r->{'SIZE'}";
+
+    # It is sometimes the case that certain updates invalidate other
+    # updates. For instance, if size changes, the old hashes are
+    # invalid. In the case that size changed, but the new hash data
+    # was not presented, make sure the old hash data is removed.
+
+   if( $oldSize != $size and
+	(defined $size) and
+    (defined $oldHash) and 
+	(!( defined $hash )))
+    {
+ 	warn "Discovery Invalidated hash due to size change: old[$oldSize] != new[$size] \n"; 
+
+	# we know we have a bad hash if a size comes in changed without a new hash
+	$r->{'HASH'} = undef;
+	$r->{'HASHDT'} = undef;
+    }
+
+    # If size changed, but fasthash not updated, then automatically clear fasthash
+
+   if( $oldSize != $size and
+	(defined $size) and
+    (defined $oldFasthash) and 
+	(!( defined $fasthash )))
+    {
+ 	warn "Discovery Invalidated fasthash due to size change: old[$oldSize] != new[$size] \n"; 
+
+	# we know we have a bad hash if a size comes in changed without a new hash
+	$r->{'FASTHASH'} = undef;
+	$r->{'FASTHASHDT'} = undef;
+	$r->{'FASTHASHDEPTH'} = undef;
+    }
+
+    # If sizes have changed, time to clean up the size -> FN and hash -> FN databases 
+
+    if( $oldSize != $size and
+	(defined $size) and
+	(defined $oldSize ) )
+    {
+	
+	$sizeDB->removeSingle( $oldSize, $afn );
+	$hashDB->removeSingle( $oldHash, $afn ) if defined $oldHash;
+	$fastDB->removeSingle( $oldFasthash, $afn ) if defined $oldFasthash;
+    }
+    
+    # Now, update our database of HASH->[LIST OF FILES]
+    
+    if( defined $hash and
+	defined $oldHash and
+	$oldHash ne $hash )
+    {
+
+       $hashDB->removeSingle( $oldHash, $afn ) if defined $oldHash;
+       $fastDB->removeSingle( $oldFasthash, $afn ) if defined $oldFasthash;
+    }
+
+    if( defined $fasthash and
+	defined $oldFasthash and
+	$oldFasthash ne $fasthash )
+    {
+	$hashDB->removeSingle( $oldHash, $afn ) if defined $oldHash;
+	$fastDB->removeSingle( $oldFasthash, $afn ) if defined $oldFasthash;
+    }
+
+    ## At this point, old associations have been cleared. 
+    ## Update the rest of the record
+    
+    $afnToAssetRecord{$afn} = $r;
+    $main::count_dbwrite++;
+
+    ### All of these caches work and are effective, but
+    ### they are disabled right now b/c no one reads from them
+
+#    $sizeDB->store( $size, $afn ) if( defined $size );
+#    $hashDB->store( $hash, $afn ) if( defined $hash );
+#    $fastDB->store( $fasthash, $afn ) if (defined $fasthash );
+
+
+    ## This code down here checks for database corruption by re-querying
+    ## the size we just put in. If they come up different,
+    ## we know there is bad mojo in the internals 
+
+
+    my $newsizea = $r->{'SIZE'};
+    my $newsize = $afnToAssetRecord{$afn}->{'SIZE'};
+    $main::count_dbread++;
+
+#    debug "After write- Size now at: $newsize vs $newsizea";
+    if( $newsizea != $newsize)
+    {
+	dbcheck();
+	warn "Bad bad mojo, maybe ok for now...";
+    }
+
+
+    return($r);
+
+    ######################
+    # Currently, hashes that change are not handled
+
+    die();
+    if( defined $hash )
+    {	
+	my $arr = $hashToAfn{$hash};
+	if( not defined $arr )
+	{
+	    $arr = [];
+	}
+	
+	my $found = 0;
+	
+	foreach my $fn (@$arr)
+	{
+	    if( $fn eq $afn )
+	    {
+		$found++;
+		last;
+	    }
+	}
+	
+	if( not $found )
+	{
+	    push @$arr, $afn;
+	}
+	
+	$hashToAfn{$hash} = $arr;
+    }
+}
+
+sub reportClose
+{
+    my $fn = shift;
+    
+    if( exists $fnTofh{$fn} )
+    {
+	my $fh = $fnTofh{$fn};
+	close $fh;
+	delete $fnTofh{$fn};
+    }
+}
+
+
+sub reportFlush
+{
+    my $fn = shift;
+    
+    if( exists $fnTofh{$fn} )
+    {
+	my $fh = $fnTofh{$fn};
+	flush $fh;
+
+    }
+}
+
+sub writeAFNtoSnapshot
+{
+    my $afn = shift;
+    my $snapFN = shift;
+  
+#    my $size = getSize( $afn );   
+#    if( $size == 0 && $includezerolen == 0)
+#    {
+#		debug "Skipping zero len: $afn";
+#		return;
+#    }
+    
+    
+
+    my $arAsHash = refreshAFN($afn,$statWindow, $fasthashWindow, $fullhashWindow);
+
+    my $ar = AssetRecord->newFromARHash( $arAsHash );
+    
+    my @REC = $ar->asArray();
+    
+    shift @REC; # take off the AFN 
+	
+    my $rec = join ":", @REC;
+    
+    report( $snapFN, "$afn\0$rec\0" );
+
+    return $ar;
+
+}
+
+
+sub report(@)
+{
+    my $fn = shift;
+    my @data = @_;
+
+    $numReports{$fn}++;
+
+    if( not exists $fnTofh{$fn} )
+    {
+	my $fh = new FileHandle;
+
+	my $xfn = $fn;
+
+	if( $xfn !~ /\./ )
+	{
+	    $xfn .= ".out";
+	}
+	
+	open $fh, ">$xfn";
+	$fnTofh{$fn} = $fh;
+    }
+	
+    my $fh = $fnTofh{$fn};
+
+    print $fh @data;
+}
+
+
+
+sub ispathsubset
+{
+    my $c = shift;
+    my @absbases = @_;
+
+    foreach my $basex (@absbases)
+    {
+	my $base = $basex; # . $FILESEP;
+	
+#	print "Comparing [$base] to [$c]\n";
+
+	$c =~ /^$base/;
+
+	if( $& )
+	{
+	    return 1;
+	}
+    }
+
+    return 0;    
+}
+
+
+sub loadAssetRecordFromAFN
+{
+    my $afn = shift;
+
+    my $arAsHash = refreshAFN($afn,$statWindow, $fasthashWindow, $fullhashWindow);
+
+    my $ar = AssetRecord->newFromARHash( $arAsHash );
+}
+
+### Performs a refresh on the file to make sure that its size, fast and full hashes are known
+### and up to date within a specified time window. This may either just verifiy that data
+### already in the checksum database is current enough to be used, or actually trigger
+### the production and calculation of a new record
+###
+### If file is in the DB, normal
+### caching rules apply. Function will decide if DB's hash is good enough.
+### If DB is not recent enough, the file is checked to make sure.
+### If the file is not in the DB, it is discovered. As a bonus, refreshAFN returns the latest record
+### of the file.
+### A -1 delay means that the parameter in question is not checked, no matter how recent or stale it is.
+### A 0 delay forces a check
+
+
+sub refreshAFN
+{
+    my $afn = shift;
+    my $okStatDelay = shift;
+    my $okFastHashDelay = shift;
+    my $okHashDelay = shift;
+    my $fh_depth = shift || 1;
+
+    # do we have it in the db?
+    
+    my $NOW = time();
+
+#    debug( "Starting refresh for $afn\n" );
+
+    my $rec;
+
+    my $r = $afnToAssetRecord{$afn};
+    $main::count_dbread++;
+
+    ## What recalcs are needed? Start with assumption nothing needs to be recalculated.
+
+    my $todoStat = 0;
+    my $todoHash = 0;
+    my $todoFastHash = 0;
+
+    ## Case where we have the record
+
+    my $recordExisted = defined $r;
+
+    ## EXPERIMENTAL: LOAD FROM PCIP 
+
+    my $sizeOnly = 0;
+    $sizeOnly = 1 if $okFastHashDelay == -1 and $okHashDelay == -1; 
+
+    if(( not $recordExisted) and (not $sizeOnly))
+    {
+	loadPCIPforAFN( $afn );
+
+	# now try again in the central database
+
+	$r = $afnToAssetRecord{$afn};
+	$main::count_dbread++;
+
+    }
+
+    my $recordExisted = defined $r;
+
+    # Begin assuming the record is blank -- we know nothing 
+
+    my $size;
+    my $hash;
+    my $lastStat;
+    my $lastChecksum;
+
+    my $fasthash;
+    my $fasthashdepth;
+    my $lastFasthash;
+
+    my $timeSinceChecksum = -1;
+    my $timeSinceFasthash = -1;
+    my $timeSinceStat = -1;
+
+	### If a record appears to exist in the persistent store, load our tmp working variables
+	### with whatever residual record is found there. It will then be up to the function later
+	### to decide if this is current enough.
+
+    if( defined $r )
+    {
+	
+	$size = $r->{'SIZE'};
+	$hash = $r->{'HASH'};
+	$fasthash = $r->{'FASTHASH'};
+
+	$lastStat = $r->{'SIZEDT'};
+	$lastChecksum = $r->{'HASHDT'};
+	$lastFasthash = $r->{'FASTHASHDT'};
+	
+	$timeSinceChecksum = $NOW - $lastChecksum;
+	$timeSinceFasthash = $NOW - $lastFasthash;
+	$timeSinceStat = $NOW - $lastStat;
+    }
+
+	### Read out to the user what we have found...
+
+    print "Refresh Check: FILE: [$afn]\n" if $MDB_DEBUG;
+    print "Refresh Check: Previous record: $recordExisted\n" if $MDB_DEBUG;
+    print "Refresh Check: desired stat delay: $okStatDelay  desired FH delay: $okFastHashDelay  desired hash delay: $okHashDelay\n" if $MDB_DEBUG;
+    print "Refresh Check: known hash[$hash]  known fasthash:[$fasthash]  known size[$size] \n" if $MDB_DEBUG;
+    print "Refresh Check: lastStat[$lastStat] lastChecksum:[$lastChecksum] timeSinceCS:[$timeSinceChecksum] timeSinceStat:[$timeSinceStat]\n" if $MDB_DEBUG;
+    print "Refresh Check: lastFasthash[$lastFasthash] timeSinceFH:[$timeSinceFasthash]\n" if $MDB_DEBUG;
+
+    # Start with the worst case -- the full hash is wanted
+
+    if( $okHashDelay >= 0 )
+    {
+        # 0 = force check
+	if( $okHashDelay == 0 )
+	{
+	    $todoHash =1;
+	}
+	elsif( $timeSinceChecksum <= -1 )
+	{
+	    $todoHash = 1;
+	}
+	elsif($timeSinceChecksum > $okHashDelay)
+	{
+	    print "Refresh Check: CHECKSUM EXPIRED: lastStat[$lastStat] lastFH:[$lastFasthash] lastChecksum:[$lastChecksum]  timeSinceStat:[$timeSinceStat] timeSinceFH:[$timeSinceFasthash] timeSinceCS:[$timeSinceChecksum]\n" if $MDB_DEBUG;
+	    print "REFRESHING CHECKSUM: [$timeSinceChecksum] $afn\n" if $MDB_DEBUG;
+	    $todoHash =1;
+	}
+	elsif( not defined $hash )
+	{
+	    $todoHash =1;
+	}
+
+	# otherwise, no need to force a hash, until later at least.
+    }
+
+    if( $okFastHashDelay >= 0 )
+    {
+        # 0 = force check
+	if( $okFastHashDelay == 0 )
+	{
+	    $todoFastHash =1;
+	}
+	elsif( $timeSinceFasthash <= -1 )
+	{
+	    $todoFastHash = 1;
+	}
+	elsif($timeSinceFasthash > $okFastHashDelay)
+	{
+	    print "Refresh Check: FASTHASH EXPIRED: lastStat[$lastStat] lastFH:[$lastFasthash] lastChecksum:[$lastChecksum]  timeSinceStat:[$timeSinceStat] timeSinceFH:[$timeSinceFasthash] timeSinceCS:[$timeSinceChecksum]\n" if $MDB_DEBUG;
+	    print "REFRESHING FASTHASH: [$timeSinceFasthash] $afn\n" if $MDB_DEBUG;
+	    $todoFastHash =1;
+	}
+	elsif( not defined $fasthash )
+	{
+	    $todoFastHash =1;
+	}
+
+	# otherwise, no need to force a hash, until later at least.
+    }
+
+    if( $okStatDelay >= 0 )
+    {
+	#force check
+	if( $okStatDelay == 0 )
+	{
+	    $todoStat = 1;
+	}
+	elsif( $timeSinceStat <= -1 )
+	{
+	    $todoStat =1;
+	}
+	elsif($timeSinceStat > $okStatDelay)
+	{
+	    $todoStat =1;
+	    print "Refresh Check: STAT EXPIRED: lastStat[$lastStat] lastFH:[$lastFasthash] lastChecksum:[$lastChecksum]  timeSinceStat:[$timeSinceStat] timeSinceFH:[$timeSinceFasthash] timeSinceCS:[$timeSinceChecksum]\n" if $MDB_DEBUG;
+
+	    print "REFRESHING STAT: [$timeSinceStat] $afn\n" if $MDB_DEBUG;
+	}
+	
+	# otherwise, no need to force a restat
+    }
+
+    print "Refresh Check: TODO: hash:$todoHash fast:$todoFastHash stat:$todoStat\n" if $MDB_DEBUG;
+
+    ## Start with the stat -- if either a hash or a stat is needed, do a stat
+
+    my $cursize;
+    my $curfasthash;
+    my $curhash;
+
+    my $sDate = undef;
+    my $fDate = undef;
+    my $hDate = undef;
+ 
+    if( $todoStat or $todoHash or $todoFastHash )
+    {
+	$cursize = getSizeHitDisk( $afn );
+	my $prevSize = $size;
+
+	$sDate = $NOW;
+
+	# If size has changed, discover_file will invalidate hashes unless a hash is provided
+
+	# force a hash recalc if one is needed. This is almost always the case 
+	# unless caller has said hashes don't matter
+
+	if( $prevSize != $cursize )
+	{
+
+
+	    print "RefreshAFN - Size has changed, checking if other actions needed\n" if $MDB_DEBUG;
+
+	    if( $okHashDelay > -1 )
+	    {
+		print "RefreshAFN - Size has changed, forcing rehash\n" if $MDB_DEBUG;
+		$todoHash = 1;
+	    }
+	    
+	    
+	    if( $okFastHashDelay > -1 )
+	    {
+		print "RefreshAFN - Size has changed, forcing refasthash\n" if $MDB_DEBUG;
+		$todoFastHash = 1;
+	    }
+	    
+	}
+
+    }
+
+    if( $todoFastHash or $todoHash )
+    {
+	$curfasthash = getFastHashHitDisk( $afn, $fh_depth );
+	$fDate = $NOW;
+
+	if( $curfasthash ne $fasthash )
+	{
+	    print "RefreshAFN - Fasthash has changed, checking if further action needed\n" if $MDB_DEBUG;
+
+	    if( $okHashDelay > -1 )
+	    {
+		print "RefreshAFN - Fasthash has changed, forcing rehash\n" if $MDB_DEBUG;
+		$todoHash = 1;
+	    }	    
+	}
+    }
+
+    if( $todoHash )
+    {
+	$curhash = getHashHitDisk( $afn );
+	$hDate = $NOW;
+    }
+
+    my $r = discover_file( $afn, $cursize, $curhash, $sDate, $hDate, undef, $curfasthash, $fDate, $fh_depth  );    
+
+    return $r;
+}
+
+
+# Returns the checksum, only if available in the DB already
+sub getChecksumPassive
+{
+    my $afn = shift;
+
+    my $r = $afnToAssetRecord{$afn};
+    $main::count_dbread++;
+    return undef if not ref $r;
+
+    my $hash = $r->{'HASH'};
+
+    return $hash;
+}
+
+
+sub testIdentical
+{
+    my $a = shift;
+    my $b = shift;
+
+    if( getSize( $a ) != getSize( $b ) )
+    {
+	return 0;
+    }
+
+    if( getFasthash( $a ) ne getFasthash( $b ) )
+    {
+	return 0;
+    }
+
+    if( getChecksum( $a ) ne getChecksum( $b ) )
+    {
+	return 0;
+    }
+
+    return 1;
+}
+
+
+
+
+
+## Returns the MD5 Hash of the AFN. 
+## This may trigger reads depending on recency rules.
+
+sub getChecksum
+{
+    my $afn = shift;
+    my $r = refreshAFN( $afn, $statWindow, $fasthashWindow, $fullhashWindow );
+    my $hash = $r->{'HASH'};
+    return $hash;
+}
+
+## Query database for the size, or recheck size if needed
+## The hash is never computed for this call
+## However, if the size is checked on disk, and happens differs from the last check, the hash
+## in the database will be recalculated. 
+
+sub getSize
+{
+    my $afn = shift;
+    my $r = refreshAFN( $afn, $statWindow, -1, -1 );
+    my $res = $r->{'SIZE'};
+    return $res;
+}
+
+sub getFasthash
+{
+    my $afn = shift;
+    my $r = refreshAFN( $afn, $statWindow, $fasthashWindow, -1 );
+    my $hash = $r->{'FASTHASH'};
+    return $hash;
+}
+
+sub printStatus
+{
+
+    print "  Full Reads: ($count_fullreads), Fast Read: ($count_fastreads) Full Stats: ($count_stat)\n";
+    print "  Full Reads (bytes): ($byte_fullreads), Fast Read (bytes): ($byte_fastreads)\n";
+
+    print "  Target Files: ($count_targetFilesProcessed)\n";
+    print "  DB reads/writes: ($main::count_dbread)/($main::count_dbwrite)\n";
+    print "\n";
+}
+
+
+
+sub doshutdown
+{
+    my $abnormal = shift;
+
+    print "\n";
+    print "  -- SHUTDOWN -- \n";
+    
+    printStatus();
+
+    untie %afnToAssetRecord;
+    untie %hashToAfn;
+    
+    unlink "$WDIR/lockfile";
+
+    flushPCIP();
+
+    foreach  my $fn (keys %fnTofh )
+    {
+	reportClose($fn);
+	print "Wrote File: $fn\n";
+	
+	if( $abnormal )
+	{
+	    rename $fn, "$fn-incomplete";
+	}
+
+   }
+
+    exit(0);
+}
+
+
+my %targets;
+my @queue;
+
+
+sub queue_rename
+{
+    my $from = shift;
+    my $to = shift;
+
+    debug( "Queue rename: [$from] -> [$to]");
+    die "Collision" if exists $targets{$to};
+     push @queue, [ "RENAME", $from, $to ];
+}
+
+
+package ReverseHash;
+
+use BerkeleyDB;
+
+BEGIN {
+    use Class::Struct;
+}
+
+
+use Class::Struct ReverseHash => 
+    [
+     db => '$',
+     debugmode => '$',
+     debugname => '$',
+    ];
+
+
+sub debug
+{
+    my $self = shift;
+    
+    if( $self->debugmode() )
+    {
+	&main::debug( "  RH:" . $self->debugname() . ": ". shift );
+    }
+
+}
+
+sub create
+{
+    my $class = shift;
+    my $db = shift;
+    my $debugmode = shift;
+    my $name = shift;
+
+    my $self = $class->new();
+    $self->db( $db );
+    $self->debugmode( $debugmode );
+    $self->debugname( $name );
+
+    $self->debug( "Created new object obn $db" );
+
+    return $self;
+}
+
+sub store
+{
+    my $self = shift;
+    my $db = $self->db();
+
+    my $key = shift;
+    my $afn = shift;
+    
+    my $value = $afn;
+
+    $self->debug( "Storing $key -> $value" );
+
+    my $status = $db->db_get($key, $value, DB_GET_BOTH);
+    $main::count_dbread++;
+    if( $status == 0 )
+    {
+	$self->debug( "  !! Association already exists in db, no action taken" );
+	return;
+    }
+    
+    
+    my $status = $db->db_put( $key, $value );
+    &main::ckstatus( $status );
+    $main::dbwrite++;
+
+    
+    return;
+}
+
+
+sub retrieveAll
+{
+    my $self = shift;
+    my $key = shift;
+
+
+    my $db = $self->db();
+
+    my $value;
+
+    my @r;
+
+    my $cursor = $db->db_cursor();
+    my $flag = DB_SET;
+    my $k = $key;
+    $main::count_dbread++;
+    while( $cursor->c_get($k, $value, $flag ) == 0)
+    {
+	$self->debug( "pulled $k -> $value" );
+	push @r, $value;
+	
+	$main::count_dbread++;
+
+	$flag = DB_NEXT_DUP;
+	    $k = $key;
+    }
+
+
+
+    
+    return @r;
+}
+
+
+sub removeSingle
+{
+    my $self = shift;
+    my $db = $self->db();
+
+    my $key = shift;
+    my $afn = shift;
+
+    my $value = $afn;
+
+#    my @values;
+
+
+    my ($k, $v) = ($key, $value );
+    my $cursor = $db->db_cursor();
+
+    $self->debug( "Removal checking $key -> $value" );
+    
+    
+#    $cursor->c_get($k, $v, DB_GET_BOTH);
+
+    $main::count_dbread++;
+    if($cursor->c_get($k, $v, DB_GET_BOTH) == 0)
+    { 
+
+	if( $v eq $value )
+	{
+	    $self->debug( "...Found association in db, now removing" );
+	    $cursor->c_del();
+	    $main::dbwrite++;
+	}
+    }
+    else
+    {
+	$self->debug( "...Association not found.." );
+    }
+    
+    
+    undef $cursor;
+}
+
+
+
+
+package FileVersion;
+
+BEGIN {
+    use Class::Struct;
+}
+
+use Class::Struct FileVersion => 
+    [
+     fn => '$',
+     size => '$',
+     hash => '$',
+     sizedate => '$',
+     hashdate => '$',
+     deldate => '$',
+     fasthash => '$',
+     fasthashdate => '$',
+     fasthashdepth => '$',
+     type => '$',
+     registrationdate => '$',
+     vaultName => '$',
+     source => '$',
+     id => '$',
+    ];
+
+
+
+
+
+package AssetRecord;
+
+BEGIN {
+    use Class::Struct;
+	#&Class::Struct::printem();
+}
+
+#my ( $afn, $size, $hash, $sizedate, $hashdate, $deldate, $fasthash, $fasthashdate, $fasthashdepth
+
+use Class::Struct AssetRecord => 
+    [
+     fn => '$',
+     size => '$',
+     hash => '$',
+     sizedate => '$',
+     hashdate => '$',
+     deldate => '$',
+     fasthash => '$',
+     fasthashdate => '$',
+	 fasthashdepth => '$',
+	 
+	 # add new stuff here
+     autoRefresh => '$'
+    ];
+    
+sub newFromARHash
+   {
+   	my $c = shift;
+   	
+   	my $self = $c->new();
+   	
+my $r = shift;   
+   
+   $self->loadFromArray(
+       
+    $r->{'FN'},
+    $r->{'SIZE'},
+    $r->{'HASH'},
+    $r->{'SIZEDT'},
+    $r->{'HASHDT'},
+    $r->{'DELDT'}, 
+    $r->{'FASTHASH'},
+    $r->{'FASTHASHDT'},
+    $r->{'FASTHASHDEPTH'}
+   );
+   
+   return $self;
+   
+   }
+   
+
+sub loadFromArray
+{
+    my $self = shift;
+
+    $self->fn( shift );
+    $self->size( shift );
+    $self->hash( shift );
+    $self->sizedate( shift );
+    $self->hashdate( shift );
+    $self->deldate( shift );
+    $self->fasthash( shift );
+    $self->fasthashdate( shift );
+    $self->fasthashdepth( shift );
+}
+
+sub asArray
+{
+ my $self = shift;
+ return (
+        $self->fn(),
+ 	$self->size(),
+ 	$self->hash(),
+ 	$self->sizedate(),
+ 	$self->hashdate(),
+ 	$self->deldate(),
+ 	$self->fasthash(),
+ 	$self->fasthashdate(),
+ 	$self->fasthashdepth() );
+
+
+}
+
+sub loadFromLiveFN
+{
+    my $self = shift;
+    my $fn = shift;
+    
+    $self->fn( $fn );
+    $self->autoRefresh( 1 );
+
+    return $self;
+}
+
+sub lookupChecksum
+{
+    my $self = shift;
+    my $fn = $self->fn();
+
+    if( $self->autoRefresh() )
+    {
+	return &main::getChecksum( $fn );
+    }
+    else
+    {
+	return $self->hash();
+    }
+}
+
+sub lookupSize
+{
+    my $self = shift;
+    my $fn = $self->fn();
+
+    if( $self->autoRefresh() )
+    {
+	return &main::getSize( $fn );
+    }
+    else
+    {
+	return $self->size();
+    }
+}
+
+
+
+# An FSE is used to encapsulate a set of files, 
+# allowing them to be queried for duplicates, hash codes, etc.
+#
+# An FSE based on a list of named files uses the master DB as a cache whenever possible
+# An FSE based on a snapshot builds an in-memory database based on the snapshot
+
+package FileSetExplorer;
+
+use Carp;
+use base qw(Class::Accessor);
+
+BEGIN { 
+    FileSetExplorer->mk_accessors( qw( ) ); 
+};
+
+
+
+
+
+package FileSetExplorer::Snapshots;
+
+my $FCA_DEBUG;
+
+use base qw(FileSetExplorer);
+
+BEGIN { 
+    $FCA_DEBUG =0;
+    FileSetExplorer::Snapshots->mk_accessors( qw( iterator paths sizeToAfn hashToAfn afnToHash) ); 
+};
+
+sub setPaths
+{
+    my $self = shift;
+    $self->paths( [@_] );
+}
+
+
+sub loadSizeCache
+{
+    my $self = shift;
+
+    return if defined $self->sizeToAfn();
+
+    print "FSE-S: Load Size Cache Starting\n"  if $FCA_DEBUG;
+
+    if( @{$self->paths()} < 1 )
+    {
+	return;
+    }
+
+    my @paths = @{$self->paths()};
+
+    my %sizeToAfn; 
+    my %hashToAfn;
+    my %afnToHash;
+    
+    while( my $fn = shift @paths )
+    {
+	next unless -f $fn;
+	
+	print "Examining included snapshot: $fn\n";
+
+	my $ssr = new SnapshotReader( $fn ); 
+	while( $ssr->hasNext() )
+	{
+	    my $ar = $ssr->getNext();
+	    
+	    my $fn = $ar->fn();
+	    my $size = $ar->size();
+	    my $hash;
+
+	    if( $FASTMODE )
+	    {
+		$hash = $ar->fasthash();
+	    }
+	    else
+	    {
+		$hash = $ar->hash();
+	    }
+
+
+	    print "Snapshot read: Found $fn with size $size and hash $hash\n";
+
+	    push @{$sizeToAfn{$size}}, $fn;
+	    push @{$hashToAfn{$hash}}, $fn;
+	    $afnToHash{$fn} = $hash;
+	}
+    }
+    
+    $self->sizeToAfn( \%sizeToAfn );
+    $self->hashToAfn( \%hashToAfn );
+    $self->afnToHash( \%afnToHash );
+
+}
+
+
+
+sub getAcceptableChecksumReal
+{
+    my $self = shift;
+    my $fn = shift;
+
+    if( $FASTMODE )
+    {
+	return $self->getFasthashReal($fn);
+    }
+    else
+    {
+	return $self->getChecksumReal($fn);
+    }
+}
+
+sub getChecksumReal
+{
+    my $self = shift;
+    my $afn = shift;
+
+    return &main::getChecksum( $afn );
+}
+
+sub getFasthashReal
+{
+    my $self = shift;
+    my $afn = shift;
+
+    return &main::getFasthash( $afn );
+}
+
+sub getSizeReal
+{
+    my $self = shift;
+    my $afn = shift;
+
+    return &main::getSize( $afn );
+}
+
+
+sub getAcceptableChecksumSnapshot() 
+{
+    my $self = shift;
+    my $afn = shift;
+
+
+    # $candidate = $self->afnToHash()->{$afn};
+
+    return $self->afnToHash()->{$afn};
+}
+
+
+
+
+
+sub getDuplicates
+{
+    my $self = shift;
+    my $fn = shift;
+    
+    $self->loadSizeCache();
+
+    my $sizeToAfn = $self->sizeToAfn();
+
+    my $size = $self->getSizeReal( $fn );
+
+    print "getDuplicates (snapshot): Testing size:$size of file:$fn to see if duplicate exists\n" if $FCA_DEBUG;
+
+
+    if( not exists $sizeToAfn->{$size})
+    {
+	# We cannot find a file in the fileset that matches this size, therefore, no duplicate!
+
+	print "    FSE: No duplicates found in fileset $self...\n";
+	
+	return();
+    }
+
+    my @afns = @{$sizeToAfn->{$size}};
+    
+    my @results;
+
+    # typically there are no duplicates, therefore if @afns < 1, exit right away
+    # big speedup from this step
+
+    if ( @afns < 1 )
+    {
+	print "getDuplicates: 1 or less found, skipping\n" if $FCA_DEBUG;
+	return @afns;
+    }
+
+    # At this point, @afns contains all files in this set that have size = the file in question
+    # We have to make sure the checksums actually match
+
+    my $checksum = $self->getAcceptableChecksumReal($fn);
+
+    # Now, see if any candidate duplicate actually shares this checksum
+
+    foreach my $c (@afns)
+    {
+	print "Sizes match, checking file [$c] as checksum-based duplicate\n" if $FCA_DEBUG;
+
+	my $candidate = $self->getAcceptableChecksumSnapshot( $c );
+
+	$candidate = $self->afnToHash()->{$c};
+
+	print "Compare: candidate hash [$candidate] to target hash [$checksum]\n" if $FCA_DEBUG;
+
+	if( $checksum eq $candidate)
+	{
+		push @results, $c;
+	}
+    }
+
+    return @results; 
+}
+
+
+
+
+
+
+
+
+
+
+package FileSetExplorer::RealFiles;
+
+my $FCA_DEBUG =0;
+
+use base qw(FileSetExplorer
+);
+
+BEGIN { 
+    FileSetExplorer::RealFiles->mk_accessors( qw( iterator paths sizeToAfn) ); 
+};
+
+sub setPaths
+{
+    my $self = shift;
+    $self->paths( [@_] );
+}
+
+# Returns the next file in the set
+
+sub getNext
+{
+    my $self = shift;
+
+    my $fi = $self->iterator();
+
+
+    if( @{$self->paths()} < 1 )
+    {
+	return undef;
+    }
+
+    if( not defined $fi )
+    {
+	$fi = new FileIterator( @{$self->paths()} );
+	$self->iterator( $fi );
+    }
+    
+    my  $fn = $fi->getNext();
+    
+    return $fn;
+}
+
+sub getAcceptableChecksum
+{
+    my $self = shift;
+    my $fn = shift;
+
+    if( $FASTMODE )
+    {
+	return $self->getFasthash($fn);
+    }
+    else
+    {
+	return $self->getChecksum($fn);
+    }
+}
+
+sub getChecksum
+{
+    my $self = shift;
+    my $afn = shift;
+
+    return &main::getChecksum( $afn );
+}
+
+sub getFasthash
+{
+    my $self = shift;
+    my $afn = shift;
+
+    return &main::getFasthash( $afn );
+}
+
+sub getSize
+{
+    my $self = shift;
+    my $afn = shift;
+
+    return &main::getSize( $afn );
+}
+
+sub loadSizeCache
+{
+    my $self = shift;
+
+    return if defined $self->sizeToAfn();
+
+    print "Load Size Cache Starting.\n"  if $FCA_DEBUG;
+
+    if( @{$self->paths()} < 1 )
+    {
+	return;
+    }
+
+    my $fi = new FileIterator( @{$self->paths()} );
+
+    my %sizeToAfn; 
+    
+    my $count = 0;
+
+    while( my $fn = $fi->getNext() )
+    {
+	if( $count % 2000 == 0)
+	{
+	    print "Read sizes for $count files from database into RAM...\n";
+	}
+
+	$count++;
+	next unless -f $fn;
+	
+	my $size = $self->getSize( $fn );
+	push @{$sizeToAfn{$size}}, $fn;
+
+	
+	
+    }
+    
+    print "Load Size Cache-DONE - Read sizes for $count files from database into RAM...\n";
+    
+    $self->sizeToAfn( \%sizeToAfn );
+
+}
+
+# getDuplicates returns matches of the listed file.
+# It starts by getting all of the sizes in the directory, using
+# a full recursive decent. It forces a checksum to be calcuated
+# or pulled from the database to check if the two really match.
+# Because of the multiple layers of caching, it is quite likely
+# that no actual disk hits are required to determine a match.
+
+sub getDuplicates
+{
+    my $self = shift;
+    my $fn = shift;
+    
+    $self->loadSizeCache();
+
+    my $sizeToAfn = $self->sizeToAfn();
+
+    my $size = $self->getSize( $fn );
+
+    print "getDuplicates: Testing size:$size of file:$fn to see if duplicate exists\n" if $FCA_DEBUG;
+
+
+    if( not exists $sizeToAfn->{$size})
+    {
+	# We cannot find a file in the fileset that matches this size, therefore, no duplicate!
+	
+	return();
+    }
+
+    my @afns = @{$sizeToAfn->{$size}};
+    
+    my @results;
+
+    # typically there are no duplicates, therefore if @afns < 1, exit right away
+    # big speedup from this step
+
+    if ( @afns < 1 )
+    {
+	print "getDuplicates: 1 or less found, skipping\n" if $FCA_DEBUG;
+	return @afns;
+    }
+
+    # At this point, @afns contains all files in this set that have size = the file in question
+    # We have to make sure the checksums actually match
+
+    my $checksum = $self->getAcceptableChecksum($fn);
+
+    # Now, see if any candidate duplicate actually shares this checksum
+
+    foreach my $c (@afns)
+    {
+	print "Checking [$c] as duplicate\n" if $FCA_DEBUG;
+
+	if( $checksum eq $self->getAcceptableChecksum( $c ) )
+	{
+	    if( $c =~ /\.inProgress$/ )
+	    {
+		print "Disregarding duplicate [$c] due to .inProgress indicator\n";
+	    }
+	    else
+	    {
+		push @results, $c;
+	    }
+	}
+    }
+
+    return @results; 
+}
+
+
+
+package SnapshotReader;
+
+use FileHandle;
+
+use base qw(Class::Accessor);
+
+BEGIN { SnapshotReader->mk_accessors( qw( fn fh count) ); }
+
+sub new
+{
+    my $class = shift;
+    my $fn = shift;
+
+    my $kid = Class::Accessor::new( $class );
+
+    $kid->{'fn'} = $fn;
+    my $fh = new FileHandle;
+    $kid->{'fh'} = $fh;
+    
+    if( $fn =~ /.bz2$/ )
+    {
+	open $fh, "bzip2 -dc $fn" or die "Cannot open [$fn]: $!";    
+    }
+    else
+    {
+	open $fh, "<$fn" or die "Cannot open [$fn]: $!";    
+    }
+
+    $kid->{'count'} = 0;
+
+    return $kid;
+}
+
+sub hasNext 
+{
+    my $self = shift;
+    my $fh = $self->fh();
+    return (not (eof $fh));
+}
+
+sub getNext
+{
+    my $self = shift;
+    my $fh = $self->{'fh'};
+
+    my( $afn, $vec);
+    {
+	my $t = $/;
+	$/ = "\0";
+	$afn = $fh->getline();
+	chomp $afn;
+	$vec = $fh->getline();
+	chomp $vec;
+	$/ = $t;
+    }
+    
+#    print "Read: [$afn], [$vec]\n";
+    
+    my $count = $self->count();
+#    print "Handling record $count\n";
+    $self->count( $self->count() +1 );
+
+    my ($size, $hash, $sizedate, $hashdate, $deldate ) = split ":", $vec;
+ 
+    my @vec = split ":", $vec;
+    my $ar = new AssetRecord();
+    $ar->autoRefresh( 0 );
+    $ar->loadFromArray( $afn, @vec );
+
+   
+    
+#    print "VEC:", join (';', @vec), "\n";
+#    print "AR $ar: ", join (';', @{$ar}), "\n";
+
+    return( $ar );
+}
+
+sub close
+{
+    my $self = shift;
+    my $fh = $self->fh();
+    my $fn = $self->fn;
+    my $count = $self->count;
+
+    close $fh;
+    print "Read $count records from snapshot [$fn]\n";
+}
+	
+
+  
+
+
+
+
+package FileCopyAgent;
+
+#use threads;
+#use threads::shared;
+#use Thread::Queue;
+use File::Copy;
+
+sub wait
+{
+    my 
+	$self = shift; 
+    
+    print "FCA: Entering wait state\n" if $FCA_DEBUG;
+    
+    $self->{THREAD}->join();
+    
+    print "FCA: Worker threads done!\n" if $FCA_DEBUG;
+}
+
+sub closeQueue
+{
+    my 
+	$self = shift; 
+    
+    print "FCA:Closing Queue by adding undefs\n" if $FCA_DEBUG;
+    
+    $self->{QUEUE}->enqueue( undef );
+
+    print "FCA:Undef marker added\n" if $FCA_DEBUG;
+
+}
+
+
+sub add
+{
+    my $self = shift;
+    my $s = shift;
+    my $d = shift;
+    my $z = shift;
+
+    print( "Adding $s -> $d (size = $z)\n" );
+    print "C:".  $self->{QUEUE} . "\n";
+
+    die unless defined $s;
+    die unless defined $d;
+    die unless defined $z;
+
+    $self->{QUEUE}->enqueue( $s );
+    $self->{QUEUE}->enqueue( $d );
+    $self->{QUEUE}->enqueue( $z );
+
+	$bytesTotal += $z;
+
+    {    
+
+	lock( $bytesInQueue );
+	$bytesInQueue += $z;
+
+	# no unlock -- var has to go out of scope
+    }
+}
+
+sub new 
+{
+    my $class = shift;
+    my $kid = bless +{}, $class;
+
+    print "FileCopyAgent: Starting - NEW \n";
+
+    my $DataQueue = Thread::Queue->new();
+
+    my $thr;
+
+    $kid->{QUEUE} = $DataQueue;
+
+    
+	$thr = threads->new(sub {
+	    print "Thread - COPY AGENT Start\n";
+	    $kid->runAgent($DataQueue);
+			    });
+
+
+    $kid->{THREAD} = $thr;
+
+    return $kid;
+}
+
+
+sub runAgent
+{
+    my $self = shift;
+    
+    my    $DataQueue=  shift;
+
+    print "FCA($self): STARTING AGENT\n";
+    $FCA_DEBUG = 1; 
+    while( 1 )
+    {
+	my $next = $DataQueue->dequeue();
+	print "FCA: Dequeue [$next]\n";
+
+	my $a = $bytesInQueue;
+	my $b = $bytesTotal;
+	my $p = $b > 0 ? $a/$b : -1;
+	my $bytesCopied = $bytesTotal - $bytesInQueue;
+	my $timeElapsed = time() - $NOW; #not totally accurate, but close enough
+	my $rate = $timeElapsed > 0 ? $bytesCopied / $timeElapsed : 0;
+	my $rateMB = $rate / 1_000_000;
+	my $remain = $rate > 0 ? $bytesInQueue / $rate : 0;
+	
+	printf( ">>>>>>>>>>>>>>>>> COPY STATUS: %2.2f/%2.2f pct=(%2.2f) rate=(%2.2f) elapsed=%d remain=%2d >>>>>>>>>>>>>>>>>\n",
+		$a/1_000_000,
+		$b/1_000_000,
+		$p * 100,
+		$rateMB,
+		$timeElapsed,
+		$remain );
+
+	if( not defined $next )
+	{
+	    print( "$self:Reader: Signal for finish reached, joining\n" )  if $FCA_DEBUG;
+	    return(1); 
+	}
+
+	print "FCA:getNext = [$next]\n" if $FCA_DEBUG;
+	
+	my $src = $next;
+	my $dest = $DataQueue->dequeue();
+	my $size = $DataQueue->dequeue();
+	
+	if( $FCA_DEBUG )
+	{
+	    print "FCA $self: Dequeue\n";
+	    print "FCA $self:  SRC: $src\n";
+	    print "FCA $self: DEST: $dest\n";
+	    print "FCA $self: SIZE: $size\n";
+	}
+
+	my $tfile = $dest . ".inProgress";
+
+	main::mkdirs( $dest );
+#	touchFile( $dest );
+
+	copy( $src, $tfile ) or die "Copy failed: $!\n";
+	
+	unlink $dest;
+	rename $tfile, $dest;
+
+	lock ( $bytesInQueue );
+	    $bytesInQueue -= $size;
+    }
+}
+
+## Todo, figure how to handle partial copies
+##  - how can they be removed best? .isPartial should not count as a "good" copy of the file
+##    send warning if one is found
+##
+## make a counter of all bytes left to copy
+## make directories flatter when copying camera cards -P --photo option
+
+## implement "ignore" dir set, and test after a lightroom rename and input
+## spawn new thread for each actual device
+## Write a marker indicating the device has been copied properly
+
+## Add a "threshhold" marker
+
+
+## MUST HAVES
+## - progress meter
+## Fast death if checksums differ after copy?
+## Clean, reportlike output for backup
+## each file in the consideration set list action taken, # total copies outstanding
+
+
+
+
+
+## Use cases:
+## 1) COme in with five different cards, want to copy them over and double check
+## 2) come in with five cards, also stuff on the hyperdrive
+##        - only should copy NEW files
+## 3) make sure I have 2 copies of all images. I connext a hard drive --
+##     copy over everything that has less than 2 copies total (including this drive)
+##
+
+
+
+sub touchFile
+{
+    my $tfile = shift;
+    my $fh = new FileHandle();
+
+    print "TOUCH: $tfile\n";
+
+    open $fh, ">$tfile" or die "Cannot touch: $tfile: $!";
+    close $fh;
+}
+
+
+
+
+
+
+
+
+
+
+
+
+package FileVersionDB;
+
+    use strict;
+
+
+sub create
+{
+    my $class = shift;
+    my @ifn = @_;
+
+    my $kid = $class->new();
+
+    $kid->idCacheHash({} );
+    $kid->countCacheHash({} );
+
+    return $kid;
+}
+
+use Class::Struct FileVersionDB => 
+    [
+     debugmode => '$',
+     debugname => '$',
+     idCacheHash => '$',
+     countCacheHash => '$',
+    ];
+
+
+sub debug
+{
+    my $self = shift;
+    
+    if( $self->debugmode() )
+    {
+	&main::debug( "FileVersionDB:" . $self->debugname() . ": ". shift );
+    }
+
+}
+
+sub getIDsMatchingHash
+{
+
+    my $self = shift;
+    my $hash = shift;
+
+    my $c = $self->idCacheHash();
+
+    my $hit = $c->{$hash};
+    
+    if( defined $hit )
+    {
+	$self->debug( "Cache hit: $hash" );
+	return @$hit;
+    }
+
+    my @id = $hashFVDB->retrieveAll( $hash );
+
+    if( @id > 5 )
+    {
+	$c->{$hash} = [@id];
+    }
+
+    return @id;
+   
+}    
+
+sub getCountMatchingHash
+{
+
+    my $self = shift;
+    my $hash = shift;
+
+    my $c = $self->countCacheHash();
+
+    my $hit = $c->{$hash};
+    
+    if( defined $hit )
+    {
+	$self->debug( "Cache hit: $hash" );
+	return $hit;
+    }
+
+    my @id = $hashFVDB->retrieveAll( $hash );
+
+    if( @id > 5 )
+    {
+	$c->{$hash} = scalar @id;
+    }
+
+    return scalar @id;
+   
+}    
+
+
+sub getWithHash
+{
+    my $self = shift;
+    my $hash = shift;
+    
+
+    my @id = $hashFVDB->retrieveAll( $hash );
+
+    return $self->mapToObjects( @id );
+}
+
+sub getWithSize
+{
+    my $self = shift;
+    my $size = shift;
+    
+    
+    my @id = $sizeFVDB->retrieveAll( $size );
+    
+    return $self->mapToObjects( @id );
+}
+
+sub mapToObjects
+{
+    my $self = shift;
+    my @id = @_;
+
+    my @result = map
+    {
+	my $id = $_;
+	#$self->debug( "Iterating over $id" );
+	my $fv = $self->loadID( $id ); 
+	die "Cannot find entry with id: $_" unless defined $fv; 
+	$fv;
+    } @id;
+
+return @result;
+}
+
+
+sub loadID
+{
+    my $self = shift;
+    my $id = shift;
+
+    my $obj = $main::fileversion{$id};
+    $main::count_dbread++;
+    
+    #$self->debug( "Loaded object with id $id" );
+    
+
+    return $obj;
+}
+
+
+sub registerFileVersion
+{
+    my $class = shift;
+    my %PARAM = @_;
+
+
+    my $fv = FileVersion->new();
+
+    die "No Hash!" unless defined $PARAM{-Hash};
+
+
+
+    $fv->fn( $PARAM{-Afn} );
+    $fv->size( $PARAM{-Size} );
+    $fv->sizedate( $PARAM{-SizeDate} );
+    $fv->fasthash( $PARAM{-FastHash} );
+    $fv->fasthashdate( $PARAM{-FastHashDate} );
+    $fv->fasthashdepth( $PARAM{-FastHashDepth} );
+    $fv->hash( $PARAM{-Hash} );
+    $fv->hashdate( $PARAM{-HashDate} );
+#    $fv->registrationdate( $PARAM{-RegistrationDate} );
+#    $fv->source( $PARAM{-Source} );
+    $fv->vaultName( $PARAM{-VaultName} );
+
+    my $id = $fv->vaultName() . "@@" . $fv->fn();
+
+    $fv->id( $id );
+    
+
+    $main::fileversion{$id} = $fv;
+    $hashFVDB->store( $fv->hash(), $id );
+
+    $main::dbwrite++;
+
+
+# not used right now
+#   $fastFVDB->store( $fv->fasthash(), $id );
+
+    if( $fv->size() >= $main::GUARD_SIZE )
+    {
+#	print "Storing size -- $main::GUARD_SIZE\n";
+	$sizeFVDB->store( $fv->size(), $id );
+    }
+
+    return $fv;
+}
+
+
+sub getNextFVID
+{
+    return "FV-$NOW"."-".$$.'-'. $FILEVERSEQ++;
+
+}
+
+
+package FileWalker;
+
+
+use strict;
+
+use Time::HiRes qw( gettimeofday tv_interval);
+
+sub create
+{
+    my $class = shift;
+    my @ifn = @_;
+
+    my $kid = $class->new();
+
+    return $kid;
+}
+
+# my $fw = new FileWalker( "/" );
+# assure("/", -1, -1, -100)
+# filecount, filesize, fasthash, hash
+
+use Class::Struct FileWalker => 
+    [
+     debugmode => '$',
+     debugname => '$',
+     indent => '$',
+    ];
+
+
+sub debug
+{
+    my $self = shift;
+    my $indent = $self->indent();
+
+    die if not ref $self;
+
+    if( $self->debugmode() )
+    {
+	&main::debug( (" " x $indent) . "FW:" . $self->debugname() . ": ". shift );
+    }
+
+}
+
+sub max
+{
+    my $a = shift;
+    my $b = shift;
+    
+    return $a if $a > $b;
+    return $b;
+
+}
+
+
+sub min
+{
+    my $a = shift;
+    my $b = shift;
+    
+    return $a if $a < $b;
+    return $b;
+
+}
+
+###
+# Assure is an all-purpose directory decent mechanism that goes
+# through and checks that recently needed things have been computed
+# within the specified time limits. In a sense, it is much like
+# "refreshAFN", except that it works on both files and directories,
+# and handles both dealing with cached "actuals" as well as inferred
+# information (such as byte totals, # of files needing backup, etc.)
+# As assure works, it updates a tree of "DirectoryEntry" files which
+# can refer to both files or directories.
+#
+# No mechanism currently exists to invalidate directory entry
+# records. For instance, if a checksum on a file changes, that would
+# ideally force a recaclulation of the entire tree containing the
+# file. However, assure does guarentee that within the delays that are
+# set out, its answer will be correct for the time period and
+# consistent from the last time it was run. Hypothesis: this will be
+# good enough in most cases.
+##
+
+
+#    my $dirent = $fw->assure( $afn, 800000,300000,-1,-1,undef,-1,3600*24*1 );
+
+sub assure
+{
+    my $self = shift;
+    my $dir = shift;
+
+    my $okCountDelay = shift;
+    my $okStatDelay = shift;
+    my $okFastHashDelay = shift;
+    my $okHashDelay = shift;
+    my $fastHashDepth = shift;
+    my $okDupDelay = shift;
+    my $okBakDelay = shift;
+
+    my $NOW = time();
+
+    my $START_GTOD = [gettimeofday];
+
+    $self->debug( "Assure:--------------------------" );
+    $self->debug( "Assure: dir:[$dir]" );
+    $self->debug( "Assure: desired count delay $okCountDelay desired stat delay: $okStatDelay  desired FH delay: $okFastHashDelay  desired hash delay: $okHashDelay" );
+    $self->debug( "Assure: desired dup delay: $okDupDelay  desired bak delay: $okBakDelay" );
+    
+    # Check the database first
+
+
+    my $DETAILEDPERF = 1;
+
+    $self->debug( "TIME: before retrieval of dirent cache: " . tv_interval( $START_GTOD )*1_000_000  ) if  $DETAILEDPERF;
+    my $dirent = DirectoryEntry->retrieve( $dir );
+    $self->debug( "TIME: After retrieval of dirent cache: " . tv_interval( $START_GTOD )*1_000_000  ) if  $DETAILEDPERF;
+
+    my $sinceCount = 0;
+    my $sinceStat  = 0;
+    my $sinceFHash = 0;
+    my $sinceHash  = 0;
+    my $sinceDup   = 0;
+    my $sinceBak   = 0;
+    
+    my $todoCount = 0;
+    my $todoStat  = 0;
+    my $todoFHash = 0;
+    my $todoHash  = 0;
+    my $todoDup   = 0;
+    my $todoBak   = 0;
+
+    if( $dirent )
+    {
+	$sinceCount = $NOW - $dirent->lastCount();
+	$sinceStat  = $NOW - $dirent->lastStat();
+	$sinceFHash = $NOW - $dirent->lastFastHash();
+	$sinceHash  = $NOW - $dirent->lastHash();
+	$sinceDup   = $NOW - $dirent->lastDup();
+	$sinceBak   = $NOW - $dirent->lastBak();
+	
+	$self->debug( "Assure: Database says time since last count:$sinceCount stat:$sinceStat fast:$sinceFHash full:$sinceHash dup:$sinceDup bak:$sinceBak" );
+
+	my $tCount = $dirent->count();
+	my $tSize  = $dirent->size();
+	my $tFHash = $dirent->fastHash();
+	my $tHash  = $dirent->hash();
+	my $tDup  = $dirent->dupState();
+	my $tBak  = $dirent->bakState();
+
+	$self->debug( "Assure: Database cached VALUES are: count:[$tCount] size:[$tSize] fhash:[$tFHash] hash:[$tHash] dupState=$tDup bakState=$tBak" );
+
+	# First, check if things are stale or if we don't have something we were asked for
+
+	$todoCount = 1 if( ($okCountDelay    > -1) && (($okCountDelay < $sinceCount )    || (not defined $dirent->count()    )));
+	$todoStat  = 1 if( ($okStatDelay     > -1) && (($okStatDelay  < $sinceStat  )    || (not defined $dirent->size()     )));
+	$todoFHash = 1 if( ($okFastHashDelay > -1) && (($okFastHashDelay < $sinceFHash ) || (not defined $dirent->fastHash() )));
+	$todoHash  = 1 if( ($okHashDelay     > -1) && (($okHashDelay  < $sinceHash  )    || (not defined $dirent->hash()     )));
+	$todoDup   = 1 if( ($okDupDelay      > -1) && (($okDupDelay  < $sinceDup  )      || (not defined $dirent->dupState() )));
+	$todoBak   = 1 if( ($okBakDelay      > -1) && (($okBakDelay  < $sinceBak  )      || (not defined $dirent->bakState() )));
+
+	if( $todoCount == 0 and
+	    $todoStat  == 0 and 
+	    $todoFHash == 0 and 
+	    $todoHash  == 0 and
+	    $todoDup   == 0 and
+	    $todoBak   == 0 )
+	{
+	    $self->debug( "Assure: Using database cached..." );
+
+	    my $totalSize = $dirent->size();
+	    my $totalFileCount = $dirent->count();
+
+	    my $lastCount = $dirent->lastCount();
+	    my $lastStat = $dirent->lastStat();
+
+	    my $fastHashCount = $dirent->fastHashCount();
+	    my $hashCount = $dirent->hashCount();
+
+	    $self->debug( "CACHE: Finished, final tally: size:$totalSize" );
+	    $self->debug( "CACHE: Count:$totalFileCount Hashcount:$hashCount fastHashCount:$fastHashCount" );
+
+	    return( $dirent );
+	}
+    }
+    else
+    {
+	$self->debug( "No previous entry found for [$dir]" );
+	$dirent = DirectoryEntry->create( $dir );
+
+	# We need to set our todo's assuming that no previous entry is present. 
+	# The first four are technically not necessary and aren't used:
+	# Count = becuase its implicit
+	# Size = because refresh AFN is ALWAYS called
+	# Fast = ditto
+	# Hash = ditto
+
+	$todoCount = 1 if $okCountDelay > -1;
+	# etc
+
+	$todoDup   = 1 if $okDupDelay > -1;
+	$todoBak   = 1 if $okBakDelay > -1;
+	
+
+    }
+
+    $self->debug( "Cache miss: todoCount[$todoCount] todoStat[$todoStat] todoFHash[$todoFHash] todoHash:[$todoHash] todoDup:[$todoDup] todoBak:[$todoBak]" );
+
+    ####
+    # If we are still here, we need to go do the actual work, since
+    # our cache was no good. There are two cases -- we are either
+    # handling a single file, or a full directory. To condense the
+    # recursion logic, both are handled with the same set of
+    # variables.
+    ##
+
+    my $afn = $dir;
+
+    my $totalSize = 0;
+    my $totalFileCount = 0;
+    
+    my $fastHashCount = 0;
+    my $hashCount = 0;
+    
+    my $dupCount = 0;
+    my $bakCount = 0; 
+    my $dupBytes = 0;
+    my $bakBytes = 0;
+    
+    my $lastCount = undef;
+    my $lastStat = undef;
+    my $lastFastHash = undef;
+    my $lastHash = undef;
+    my $lastDup = undef;
+    my $lastBak = undef;
+
+    my $dupState = undef;
+    my $bakState = undef;
+
+    my $kind;
+
+    if( -f $afn )
+    {
+	$kind = 'FILE';
+
+	if( $todoDup )
+	{
+	    die "Duplicate detection not implemented-- yet";
+	}
+	
+	if( $todoBak )
+	{
+	    # Start with the basic presumption that the file needs to
+	    # be backed up and try to disprove. 
+
+	    my $hasSizeMatch = 0;
+	    my $needsBackup = 1; 
+	    my $hash = &main::getChecksumPassive( $afn );
+	    $self->debug( "TIME: After cs passive: " . tv_interval( $START_GTOD )*1_000_000  ) if  $DETAILEDPERF;
+
+
+	    my $size = &main::getSize( $afn );
+	    $self->debug( "TIME: After size: " . (tv_interval( $START_GTOD )*1_000_000)  ) if  $DETAILEDPERF;
+
+	    # Two different strategies may be used to check for a
+	    # backup based on the file size and hash status: For small
+	    # files or files that already have a computed hash, go
+	    # right to computing the hashes using the hash reverse
+	    # database. However, if the file size is big, the strategy
+	    # first checks if a given size is even in the database,
+	    # and if it is, then check the hashes (forcing a hash test
+	    # if needed).  
+
+
+	    if( $size < $main::GUARD_SIZE or defined $hash )
+	    {
+		# Skip right to the hash strategy
+
+		$self->debug( "[BEGIN] Strategy 1 - Checking for backups with the same HASH ($hash) [size=$size, guard=$main::GUARD_SIZE]" );
+
+		$hash = &main::getChecksum($afn);
+
+		$self->debug( "TIME: After retrieval of forced checksum: " . tv_interval( $START_GTOD )*1_000_000  ) 
+		    if  $DETAILEDPERF;
+
+		my $c = $fvDB->getCountMatchingHash( $hash );
+
+		$self->debug( "TIME: After retrieval of count matching hash " . tv_interval( $START_GTOD )*1_000_000  ) 
+		    if  $DETAILEDPERF;
+
+		if( $c > 0 )
+		{
+		    $self->debug( " ++ Found $c entries matching..." );
+		    $needsBackup = 0;
+		}
+
+	    }
+	    else
+	    {
+    
+		$self->debug( "[BEGIN] Strategy 2 - Checking for backups with the same SIZE ($size):" );
+		my @fvs = $fvDB->getWithSize( $size );
+		
+		foreach my $fv (@fvs )
+		{
+
+		    my $source = $fv->source();
+		    my $type = $fv->type();
+		    my $vaultName = $fv->vaultName();
+		    my $id = $fv->id();
+		    
+		    $self->debug( " ++ ID: $id" );
+		    $self->debug( "    (vault:[$vaultName] source:[$source])" );
+
+		    ## At this point, we need to force a full checksum
+
+		    $hash = &main::getChecksum( $afn ) if( not defined $hash );
+
+		    if( $hash eq $fv->hash() )
+		    {
+			$self->debug( "    !! Hashes match, backup found" );
+			$needsBackup = 0;
+			last;
+		    }
+		    else
+		    {
+			$self->debug( "    !! Hashes do not match" );
+		    }
+		    
+		    
+		    $hasSizeMatch = 1;
+		}
+	    }
+
+	    if( $needsBackup == 1 )
+	    {
+		$self->debug( "[END] Backup is needed" );
+		$bakCount++;
+		$bakBytes += $size;
+		$bakState =  1;
+
+		&main::report( "$assurePREFIX-backups-full-report.txt", "BAK?=YES $afn\n");
+		&main::report( "$assurePREFIX-backups-needed-newline.txt", "$afn\n" );
+		&main::report( "$assurePREFIX-backups-needed-zeroterm.txt", "$afn\0" );	    
+
+		if( not ( $afn =~ /\.DS_Store$/ or
+			  $afn =~ /.xmp$/ or
+			  $afn =~ /.picasa.ini$/ ))
+		{
+
+		    &main::report( "$assurePREFIX-backups-needed-human.txt", "$afn\n" );	    
+		}
+
+
+	    }
+	    else
+	    {
+		&main::report( "$assurePREFIX-backups-full-report.txt", "BAK?=NO  $afn\n");
+		$self->debug( "[END] Backup is not needed" );
+		$bakState =  1;
+	    }
+
+	    $lastBak = $NOW;
+	}
+	
+	## Make sure other parameters requested by the assure() are met
+
+	my $r = &main::refreshAFN( $afn, $okStatDelay, $okFastHashDelay, $okHashDelay );
+
+	
+	$lastCount   = $NOW;
+	$lastStat    =   $r->{'SIZEDT'};
+	$lastFastHash =  $r->{'FASTHASHDT'};
+	$lastHash     =  $r->{'HASHDT'};
+
+	$totalSize = $r->{'SIZE'};
+	$totalFileCount = 1;       
+	$hashCount = $r->{'HASH'} ? 1 : 0;
+	$fastHashCount = $r->{'FASTHASH'} ? 1 : 0 ;
+
+
+
+    }
+
+    ###
+    # This is the directory handling case
+    ###
+
+    elsif( (-d $afn) and (not -l $afn ))
+    {
+
+	$kind = 'DIR';
+
+	$lastCount = $NOW;
+	$lastStat = $NOW;
+	$lastFastHash = $NOW;
+	$lastHash = $NOW;
+	$lastDup = $NOW;
+	$lastBak = $NOW;
+
+	$bakState = 1;
+
+	opendir DIR, $dir;
+	
+	my @contents;
+
+	@contents = readdir DIR;
+
+	closedir DIR;
+
+#	print "I have " . (scalar @contents ) . " files.\n";
+
+	foreach my $entry (@contents )
+	{
+#	     print "Found - $entry\n";
+	     
+	    my $afn = $dir . "/" . $entry;
+
+	    my $totalCount;
+	    
+	    next if $entry eq "..";
+	    next if $entry eq ".";
+	    next if $entry eq ".pcip_info";
+	    next if $entry eq ".DS_Store";
+
+	    $self->indent( $self->indent() + 5 );
+	    my $subdirent = $self->assure( $afn, $okCountDelay, $okStatDelay, $okFastHashDelay, $okHashDelay, $fastHashDepth, $okDupDelay, $okBakDelay );
+	    $self->indent( $self->indent() - 5 );
+
+	    $totalFileCount += $subdirent->count();
+	    $totalSize      += $subdirent->size();
+	    
+	    $lastStat     = min( $lastStat,      $subdirent->lastStat()     );
+	    $lastFastHash = min( $lastFastHash,  $subdirent->lastFastHash() );
+
+	    $lastHash     = min( $lastHash, 	 $subdirent->lastHash()     );
+	    $lastDup     = min( $lastDup, 	 $subdirent->lastDup()     );
+	    $lastBak     = min( $lastBak, 	 $subdirent->lastBak()     );
+	    
+	    $hashCount += $subdirent->hashCount();
+	    $fastHashCount += $subdirent->fastHashCount();
+
+	    $dupCount += $subdirent->dupCount();
+	    $dupBytes += $subdirent->dupBytes();
+	    $bakCount += $subdirent->bakCount();
+	    $bakBytes += $subdirent->bakBytes();
+
+	    $bakState = 0 if $subdirent->bakState() == 0;
+	    
+	}
+
+
+
+	
+    }	
+    else
+    {
+	# Neither a directory or a file.. hmmm
+
+
+	$bakState = 1; 
+	$lastBak = $NOW;
+
+	$self->debug( "" );
+	$self->debug( "" );
+	$self->debug( "" );
+	$self->debug( " XXX XXX XXX Corner case - symlink?" );
+	$self->debug( " XXX XXX XXX Corner case - symlink?" );
+	$self->debug( " XXX XXX XXX Corner case - symlink?" );
+	$self->debug( "" );
+	$self->debug( "" );
+	$self->debug( "" );
+
+	&main::report( "$assurePREFIX-unhandled-by-assure-$$.txt", "$afn\n" );
+
+    }
+
+
+    $dirent->count( $totalFileCount );
+    $dirent->size(  $totalSize      );
+    
+    $dirent->lastCount( $NOW );
+    $dirent->lastStat( $lastStat );
+    $dirent->lastFastHash( $lastFastHash );
+    $dirent->lastHash( $lastHash );
+    $dirent->lastDup( $lastDup );
+    $dirent->lastBak( $lastBak );
+    
+    $dirent->hashCount( $hashCount );
+    $dirent->fastHashCount( $fastHashCount );
+    
+    $dirent->hash(     'OK' ) if $okHashDelay > -1;
+    $dirent->fastHash( 'OK' ) if $okFastHashDelay > -1;
+
+    $dirent->dupCount( $dupCount ) if $todoDup;
+    $dirent->dupBytes( $dupBytes ) if $todoDup;
+    $dirent->dupState ( $dupState ) if $todoDup;
+
+    $dirent->bakCount( $bakCount ) if $todoBak;
+    $dirent->bakBytes( $bakBytes ) if $todoBak;
+    $dirent->bakState( $bakState ) if $todoBak;
+
+    $self->debug( "Finished, final tally: size:$totalSize lastStat:$lastStat lastFastHash:$lastFastHash lastHash:$lastHash lastBak:$lastBak" );
+
+    $self->debug( "Count:$totalFileCount Hashcount:$hashCount fastHashCount:$fastHashCount" );
+    $self->debug( "DupCount:$dupCount DupBytes:$dupBytes BakCount:$bakCount BakBytes:$bakBytes bakState=$bakState" );
+    
+
+
+    my $elapsed = tv_interval( $START_GTOD )*1_000_000;
+    $self->debug( "TIME: Prior to DB write $elapsed" );
+
+    $dirent->store();
+
+    $elapsed = tv_interval( $START_GTOD )*1_000_000;
+
+    $totalFileCount = 1 if( $totalFileCount < 1 );
+
+    my $perCount =  $elapsed / ($totalFileCount);
+    $self->debug( "Total time in assure after write DB: $elapsed microseconds $perCount/entry" );
+
+
+    if( $kind eq 'DIR' )
+    {
+	&main::report( "$assurePREFIX-dir-timings.txt", "$perCount  $elapsed  $dir\n" );
+    }
+    
+    return( $dirent );
+    
+}
+
+
+
+package FileIterator;
+
+use threads;
+use Thread::Queue;
+use File::Find;
+
+my $FI_DEBUG : shared = 1;
+
+
+
+
+
+sub new
+{
+    my $class = shift;
+    my @ifn = @_;
+    my $kid = bless +{}, $class;
+    $kid->{"ARGS"} = [@ifn];
+
+    my @fn = map 
+    { 
+	"" . File::Spec->rel2abs( $_ );  
+    }  @ifn;
+
+
+    $kid->start( @fn );
+}
+
+sub newRelative
+{
+    my $class = shift;
+    my @ifn = @_;
+    my $kid = bless +{}, $class;
+    $kid->{"ARGS"} = [@ifn];
+
+    $kid->start( @ifn );
+}
+
+sub start
+{
+    my $kid = shift; 
+    my @fn = @_;
+
+    # reportmain "FileIterator: Starting\n";
+
+    my $DataQueue = Thread::Queue->new();
+
+    my $thr;
+
+    if( not $recurse )
+    {
+	$thr = threads->new(sub {
+	    my @files = @fn;
+	    print "Thread FileIterator: Starting: @fn\n"  if $FI_DEBUG;
+	    
+	    while( @files > 0 )
+	    {
+		$DataQueue->enqueue( shift @files );
+#		      print "Thread found: $found\n" if $FI_DEBUG;
+	    }
+	    $DataQueue->enqueue( undef );
+	});
+    }
+    else
+    {
+	$thr = threads->new(sub {
+	    my @files = @fn;
+	    print "Thread FileIterator: Starting: @files\n";
+	    find( { no_chdir => 1,
+		    wanted => 
+		  sub 
+		  {	
+		      my $found = $File::Find::name;
+		      print "Thread found: $found\n" if $FI_DEBUG;
+		      $DataQueue->enqueue( $found );
+		  }}, 
+    @files );
+	    $DataQueue->enqueue( undef );
+	});
+    }   
+
+    $kid->{QUEUE} = $DataQueue;
+    $kid->{THREAD} = $thr;
+
+    return $kid;
+}
+
+## Contract: always return absolute paths!!
+
+sub getNext
+{
+    my $self = shift;
+
+	print( "fi:getNext() - GET NEXT\n" )  if $FI_DEBUG;
+
+    my    $DataQueue=     $self->{QUEUE};	
+    my    $thr =    $self->{THREAD};
+    
+    my $next = $DataQueue->dequeue();
+    if( not defined $next )
+    {
+	print( "Reader: Queue empty, joining\n" )  if $FI_DEBUG;
+	
+    }
+    print "FI:getNext = [$next]\n" if $FI_DEBUG;
+
+    if( ($next =~ /.pcip_info$/) or
+	($next =~ /\/.fseventsd\//) or
+	($next =~ /\/.Spotlight-V100\//) or
+	($next =~ /\/Desktop DB$/) or
+	($next =~ /\/Desktop DF$/) 
+	
+
+	
+	)
+    {
+	return $self->getNext();
+    }
+
+    return $next;
+}
+
+
+package DirectoryEntry;
+
+use strict;
+
+BEGIN {
+    use Class::Struct;
+}
+
+use Class::Struct DirectoryEntry => 
+    [
+     'afn' => '$',
+     'count' => '$',
+     'size'  => '$',
+     'fastHash' => '$',
+     'hash' => '$',
+
+     'lastCount' => '$',
+     'lastStat'  => '$',
+     'lastFastHash'  => '$',
+     'lastHash'  => '$',
+     'lastDup'  => '$',
+     'lastBak'  => '$',
+
+     'hashCount' => '$',
+     'fastHashCount' => '$',
+
+     'dupState' => '$',
+     'dupBytes' => '$',
+     'dupCount' => '$',
+
+     'bakState' => '$',
+     'bakBytes' => '$',
+     'bakCount' => '$',
+
+
+    ];
+
+
+sub retrieve 
+{
+    my $class = shift;
+    my $afn = shift;
+
+
+#    &main::debug( "Checking databaes for: $afn" );
+
+    my $e = $main::afnToDirent{$afn};
+    $main::count_dbread += 1;
+
+#    die "cons check failed" if $e->afn() ne $afn;
+
+    return $e;
+}
+
+sub store
+{
+    my $self = shift;
+    my $afn = $self->afn();
+    die "store failed due to blank afn"  if not $afn;
+
+    $main::afnToDirent{$afn} = $self;
+    $main::count_dbwrite++;
+
+#    &main::debug( "Writing out dirent: $afn" );
+
+    return();
+}
+
+
+
+sub create
+{
+    my $class = shift;
+    my $afn = shift;
+
+    my $kid = $class->new();
+
+    $kid->afn( $afn );
+
+    return $kid;
+}
+
+
+
+
+
+### why I switched on the concurrent db, even though we are not using transactions.
+### was getting deadlocks frequently that were unlockable with db_deadlock 
+### but didn't make sense to me
+###
+##
+## deadlocks are natural parts of berkeley db:
+
+## "Even when Berkeley DB automatically handles database locking, it
+## is normally possible for deadlock to occur. Because the underlying
+## database access methods may update multiple pages during a single
+## Berkeley DB API call, deadlock is possible even when threads of
+## control are making only single update calls into the database. The
+## exception to this rule is when all the threads of control accessing
+## the database are read-only or when the Berkeley DB Concurrent Data
+## Store product is used; the Berkeley DB Concurrent Data Store
+## product guarantees deadlock-free operation at the expense of
+## reduced concurrency."
+
+## http://pybsddb.sourceforge.net/ref/transapp/deadlock.html
+
+## It is often desirable to have concurrent read-write access to a
+## database when there is no need for full recoverability or
+## transaction semantics. For this class of applications, Berkeley DB
+## provides an interface supporting deadlock-free,
+## multiple-reader/single writer access to the database. This means
+## that at any instant in time, there may be either multiple readers
+## accessing data or a single writer modifying data. The application
+## is entirely unaware of which is happening, and Berkeley DB
+## implements the necessary locking and blocking to ensure this
+## behavior.
+
+## To create Berkeley DB Concurrent Data Store applications, you must
+## first initialize an environment by calling DB_ENV->open. You must
+## specify the DB_INIT_CDB and DB_INIT_MPOOL flags to that
+## interface. It is an error to specify any of the other DB_ENV->open
+## subsystem or recovery configuration flags, for example,
+## DB_INIT_LOCK, DB_INIT_TXN, or DB_RECOVER. All databases must, of
+## course, be created in this environment by using the db_create
+## interface or Db constructor, and specifying the environment as an
+## argument.
+
+
+
